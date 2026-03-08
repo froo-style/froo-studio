@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>FROO.studio — Tech Pack Generator</title>
+<title>FROO.studio — Tech Pack Bot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
 <script src="config.js"></script>
@@ -19,27 +19,15 @@ html,body,#root{height:100%;background:#080808}
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const {useState,useEffect}=React;
+const {useState,useEffect,useRef,useCallback}=React;
+const G="#c9a96e";
+const POLL_INTERVAL=30000;
 
-// Keys are loaded from config.js — keep that file private
-const CFG = (typeof FROO_CONFIG !== "undefined") ? FROO_CONFIG : {
-  SUPABASE_URL:   "",
-  SUPABASE_KEY:   "",
-  GEMINI_KEY:     "",
-  SENDGRID_KEY:   "",
-  SLACK_TOKEN:    "",
-  FROM_EMAIL:     "",
+const CFG=(typeof FROO_CONFIG!=="undefined")?FROO_CONFIG:{
+  SUPABASE_URL:"",SUPABASE_KEY:"",GEMINI_KEY:"",SENDGRID_KEY:"",
+  SLACK_TOKEN:"",FROM_EMAIL:"",SOURCE_CHANNEL:"",
 };
 
-const BRANDS=["Sweet Threads","Froo","Soiree","Prairie"];
-const CATEGORIES=["Baby","Boys","Girls","Preteen","Teen"];
-const SAMPLE_SIZES={
-  Baby:["6M","9M","12M","18M","24M","2Y","3Y","4Y"],
-  Boys:["2Y","3Y","4Y","5Y","6Y","7Y","8Y","10Y"],
-  Girls:["2Y","3Y","4Y","5Y","6Y","7Y","8Y","10Y"],
-  Preteen:["10","12","14","16"],
-  Teen:["12","14","16","18","20"],
-};
 const CHART_LIB=[
   {code:"ST127",name:"Capri Denim Dress",sizes:"3Y-22"},
   {code:"ST144",name:"Paxon Romper",sizes:"6M-4Y"},
@@ -74,41 +62,30 @@ const BLOCK_RULES=[
   {kw:["pyjama","pajama","pj"],codes:["NELLIE-PJ"]},
   {kw:["swim","swimsuit","bathing"],codes:["ST296","ST304","FR1722"]},
 ];
-const SZ_QS=[
-  {k:"garmentType",label:"Garment Type",opts:["Top/Blouse","Dress","Skirt","Pants/Shorts","Romper","Blazer","PJ Set","Swimwear"]},
-  {k:"fabricType",label:"Fabric Type",opts:["Woven","Knit","Denim","Swim/Lycra","Lace"]},
-  {k:"sleeve",label:"Sleeve",opts:["Sleeveless","Short","3/4","Long","N/A"]},
-  {k:"neck",label:"Neckline",opts:["Round","V-neck","Peter Pan","Band collar","Square","Off-shoulder"]},
-  {k:"waist",label:"Waist",opts:["Elastic","Flat/Zip","Drawstring","No waist","N/A"]},
-  {k:"hem",label:"Hem Length",opts:["Mini","Above knee","Knee","Midi","Maxi","Cropped"]},
-];
 const DETAIL_KW=["embroidery","lace","button","smocking","pleat","bow","ruffle","collar","cuff","pocket","zipper","piping","trim","print","broderie"];
-const STEPS=["Style Brief","Brand & Size","Fabric","Size Chart","Sketch & Mockup","Approval","Tech Pack"];
-const G="#c9a96e";
 
+// --- UTILITY ---
 function escHtml(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
-function isSampleSize(candidate,sampleSz){return candidate===sampleSz||candidate===sampleSz.replace("Y","")||candidate===sampleSz.replace("M","");}
-function slackChannelName(sampleNo,styleName){return(sampleNo+"-"+styleName).toLowerCase().replace(/\s+/g,"-").replace(/[^a-z0-9-]/g,"");}
-const PH_SKETCH_FRONT="https://placehold.co/300x400/0d0d0d/c9a96e?text=SKETCH+FRONT";
-const PH_SKETCH_BACK="https://placehold.co/300x400/0d0d0d/c9a96e?text=SKETCH+BACK";
-const PH_MOCKUP_FRONT="https://placehold.co/300x400/0d0d0d/4caf50?text=3D+MOCKUP+FRONT";
-const PH_MOCKUP_BACK="https://placehold.co/300x400/0d0d0d/4caf50?text=3D+MOCKUP+BACK";
+function slackChannelName(no,name){return(no+"-"+name).toLowerCase().replace(/\s+/g,"-").replace(/[^a-z0-9-]/g,"");}
+function guessBody(t){const l=t.toLowerCase();for(const r of BLOCK_RULES)if(r.kw.some(k=>l.includes(k)))return r;return null;}
+function filterCat(codes,cat){
+  const baby=["ST144","ST71-2","ST1737","ST1926","ST296","ST304"];
+  const kids=["ST38","ST77","ST95","ST127","ST028","ST43","ST71-1","FR1722"];
+  const teen=["ST173","ST269","FR1730","ST1","NELLIE-PJ","SFCDP","SCT","PR1927"];
+  const map={Baby:baby,Boys:kids,Girls:kids,Preteen:[...kids,...teen],Teen:teen};
+  return codes.filter(c=>(map[cat]||[]).includes(c));
+}
+function getDetails(t){return DETAIL_KW.filter(k=>t.toLowerCase().includes(k));}
 
+// --- API ---
 async function callClaude(messages,system){
   const r=await fetch("https://api.anthropic.com/v1/messages",{
     method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,
+    body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1500,
       system:system||"You are a professional kidswear tech pack assistant. Be concise and technical. No markdown.",messages}),
   });
   const d=await r.json();
   return d.content?.[0]?.text||"";
-}
-async function supabaseFetch(table,filters={}){
-  const params=Object.entries(filters).map(([k,v])=>k+"=eq."+encodeURIComponent(v));
-  const url=CFG.SUPABASE_URL+"/rest/v1/"+table+"?"+params.join("&");
-  const r=await fetch(url,{headers:{"apikey":CFG.SUPABASE_KEY,"Authorization":"Bearer "+CFG.SUPABASE_KEY}});
-  if(!r.ok)throw new Error("Supabase "+r.status);
-  return r.json();
 }
 async function geminiCall(contents,generationConfig){
   const r=await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key="+CFG.GEMINI_KEY,{
@@ -118,1013 +95,605 @@ async function geminiCall(contents,generationConfig){
   const d=await r.json();
   return d.candidates?.[0]?.content?.parts?.[0]?.text||"";
 }
-function geminiText(prompt){
-  return geminiCall([{parts:[{text:prompt}]}],{temperature:0.4,maxOutputTokens:700});
-}
-function geminiVision(b64,mimeType,prompt){
-  return geminiCall([{parts:[{inline_data:{mime_type:mimeType,data:b64}},{text:prompt}]}],{temperature:0.2,maxOutputTokens:500});
-}
-async function sendEmail(to,subject,html){
-  const r=await fetch("https://api.sendgrid.com/v3/mail/send",{
-    method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+CFG.SENDGRID_KEY},
-    body:JSON.stringify({personalizations:[{to:[{email:to}]}],from:{email:CFG.FROM_EMAIL},subject,content:[{type:"text/html",value:html}]}),
-  });
-  if(!r.ok)throw new Error("SendGrid "+r.status);
-  return true;
-}
-async function slackCreateChannel(name){
-  const r=await fetch("https://slack.com/api/conversations.create",{
-    method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+CFG.SLACK_TOKEN},
-    body:JSON.stringify({name}),
+function geminiText(p){return geminiCall([{parts:[{text:p}]}],{temperature:0.4,maxOutputTokens:700});}
+function geminiVision(b64,mime,p){return geminiCall([{parts:[{inline_data:{mime_type:mime,data:b64}},{text:p}]}],{temperature:0.2,maxOutputTokens:500});}
+
+// --- SLACK API ---
+async function slackGET(endpoint,params={}){
+  const qs=new URLSearchParams(params).toString();
+  const r=await fetch(`https://slack.com/api/${endpoint}${qs?"?"+qs:""}`,{
+    headers:{"Authorization":"Bearer "+CFG.SLACK_TOKEN},
   });
   const d=await r.json();
-  if(!d.ok)throw new Error(d.error||"Slack channel creation failed");
-  return d.channel.id;
+  if(!d.ok)throw new Error(d.error||endpoint+" failed");
+  return d;
 }
-async function slackPost(channel,text){
-  const r=await fetch("https://slack.com/api/chat.postMessage",{
+async function slackPOST(endpoint,body){
+  const r=await fetch("https://slack.com/api/"+endpoint,{
     method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+CFG.SLACK_TOKEN},
-    body:JSON.stringify({channel,text}),
+    body:JSON.stringify(body),
   });
-  return (await r.json()).ok;
+  const d=await r.json();
+  if(!d.ok)throw new Error(d.error||endpoint+" failed");
+  return d;
 }
-function fileToB64(file){
-  return new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(rd.result.split(",")[1]);rd.onerror=rej;rd.readAsDataURL(file);});
+async function slackFindChannel(nameOrId){
+  if(/^[CG][A-Z0-9]{6,}$/.test(nameOrId))return nameOrId;
+  const name=nameOrId.replace(/^#/,"");
+  const d=await slackGET("conversations.list",{limit:200,exclude_archived:true,types:"public_channel,private_channel"});
+  const ch=(d.channels||[]).find(c=>c.name===name);
+  if(!ch)throw new Error(`Channel #${name} not found — check the bot token has access.`);
+  return ch.id;
 }
-function guessBody(text){const t=text.toLowerCase();for(const r of BLOCK_RULES)if(r.kw.some(k=>t.includes(k)))return r;return null;}
-function filterCat(codes,cat){
-  const baby=["ST144","ST71-2","ST1737","ST1926","ST296","ST304"];
-  const kids=["ST38","ST77","ST95","ST127","ST028","ST43","ST71-1","FR1722"];
-  const teen=["ST173","ST269","FR1730","ST1","NELLIE-PJ","SFCDP","SCT","PR1927"];
-  const map={Baby:baby,Boys:kids,Girls:kids,Preteen:[...kids,...teen],Teen:teen};
-  return codes.filter(c=>(map[cat]||[]).includes(c));
+async function slackGetHistory(channelId,oldest){
+  const d=await slackGET("conversations.history",{channel:channelId,oldest:oldest||"0",limit:20,inclusive:false});
+  return([...(d.messages||[])].reverse());
 }
-function getDetails(text){return DETAIL_KW.filter(k=>text.toLowerCase().includes(k));}
+async function slackCreateOrFindChannel(name){
+  try{
+    const d=await slackPOST("conversations.create",{name,is_private:false});
+    return d.channel.id;
+  }catch(e){
+    if(e.message==="name_taken")return slackFindChannel(name);
+    throw e;
+  }
+}
+async function slackPostMessage(channel,text,blocks){
+  return slackPOST("chat.postMessage",{channel,text,...(blocks?{blocks}:{})});
+}
+async function slackCreateCanvas(channelId,title,markdown){
+  const d=await slackPOST("canvases.create",{
+    channel_id:channelId,title,
+    document_content:{type:"markdown",markdown},
+  });
+  return d.canvas_id;
+}
+async function slackDownloadAsB64(urlPrivate){
+  const r=await fetch(urlPrivate,{headers:{"Authorization":"Bearer "+CFG.SLACK_TOKEN}});
+  if(!r.ok)throw new Error("File download failed: "+r.status);
+  const blob=await r.blob();
+  return new Promise((res,rej)=>{
+    const rd=new FileReader();
+    rd.onload=()=>res({b64:rd.result.split(",")[1],mime:blob.type});
+    rd.onerror=rej;
+    rd.readAsDataURL(blob);
+  });
+}
 
+// --- SAMPLE PARSING ---
+async function parseSampleMessage(text){
+  const r=await callClaude([{role:"user",content:`Extract tech pack sample details from this Slack message. Return valid JSON only — no markdown, no explanation.
+
+{
+  "sampleNo": "",
+  "styleName": "",
+  "brand": "",
+  "cat": "",
+  "sz": "",
+  "season": "",
+  "colorway": "",
+  "desc": ""
+}
+
+Available brands: Sweet Threads, Froo, Soiree, Prairie
+Available categories: Baby, Boys, Girls, Preteen, Teen
+Sizes: 6M 9M 12M 18M 24M 2Y 3Y 4Y 5Y 6Y 7Y 8Y 10Y or numeric 10 12 14 16 18 20
+
+If a field is unclear, leave it empty. Put the full garment description in "desc".
+
+Message:
+${text.slice(0,2000)}`}]);
+  try{
+    const m=r.match(/\{[\s\S]*?\}/);
+    if(m)return JSON.parse(m[0]);
+  }catch(e){}
+  return null;
+}
+
+// --- TECH PACK BUILDER ---
+async function buildTechPack(sample,logFn){
+  logFn("sketch");
+  const prompt=await callClaude([{role:"user",content:
+    `Write a concise technical sketch prompt (max 80 words) for:\n${sample.styleName} - ${sample.desc}\nBrand: ${sample.brand} | Category: ${sample.cat}\nInclude: garment type, silhouette, key construction details, front and back views. Return only the prompt text.`
+  }]).catch(()=>"Technical flat sketch: "+sample.styleName+". "+sample.desc);
+
+  logFn("descriptions");
+  const [skDesc,mkDesc]=await Promise.all([
+    geminiText(`Fashion technical sketch expert.\nGarment: ${prompt}\n\nTechnical sketch notes:\n1. FRONT VIEW - silhouette, neckline, sleeves, bodice, hemline, closures, pockets, trims\n2. BACK VIEW - neckline, closure, construction\n3. KEY DETAILS - seams, topstitching, gathering, pleats\nMax 200 words.`).catch(()=>""),
+    (sample.inspoB64
+      ?geminiVision(sample.inspoB64,sample.inspoMime,`Fabric/garment for: ${sample.styleName} - ${sample.desc}\nDescribe 3D mockup on children's mannequin:\n1. FRONT VIEW\n2. BACK VIEW\n3. OVERALL fit\nMax 180 words.`)
+      :geminiText(`3D fashion mockup for: ${sample.styleName} - ${sample.desc}\n1. FRONT VIEW on mannequin\n2. BACK VIEW\n3. OVERALL\nMax 180 words.`)
+    ).catch(()=>""),
+  ]);
+
+  let inspoAnalysis="",callouts=[];
+  if(sample.inspoB64){
+    logFn("image");
+    const details=getDetails(sample.desc||"");
+    const [analysis,...coDescs]=await Promise.all([
+      geminiVision(sample.inspoB64,sample.inspoMime,"Describe this fashion inspiration image: garment, silhouette, colours, key design features, fabric, special details. Max 150 words.").catch(()=>""),
+      ...details.slice(0,4).map(d=>
+        geminiVision(sample.inspoB64,sample.inspoMime,`Focus on the ${d} detail. Describe for factory: technique, placement, dimensions, colour, construction. Max 60 words.`).catch(()=>"")
+      ),
+    ]);
+    inspoAnalysis=analysis;
+    callouts=details.slice(0,4).map((d,i)=>({label:d,desc:coDescs[i]||""}));
+  }
+
+  logFn("chart");
+  const rule=guessBody((sample.desc||"")+" "+(sample.styleName||""));
+  let chart=null;
+  if(rule){
+    const filtered=filterCat(rule.codes,sample.cat);
+    const code=filtered[0]||rule.codes[0];
+    chart=CHART_LIB.find(x=>x.code===code)||null;
+  }
+
+  logFn("notes");
+  const notes=await callClaude([{role:"user",content:
+    `Generate 10 precise factory bullet-point notes:\nStyle: ${sample.styleName} (${sample.sampleNo})\nBrand: ${sample.brand} | ${sample.cat} | Size ${sample.sz} | ${sample.season}\nColorway: ${sample.colorway||"N/A"}\nDescription: ${sample.desc}\nCover: silhouette, fabric, construction, closures, trims, hem, special details. Number each point.`
+  }]).catch(()=>"Factory notes unavailable.");
+
+  return{prompt,skDesc,mkDesc,inspoAnalysis,callouts,chart,notes};
+}
+
+// --- CANVAS MARKDOWN ---
+function buildCanvasMarkdown(sample,tp){
+  const date=new Date().toLocaleDateString("en-GB");
+  let md=`# ${(sample.brand||"").toUpperCase()} — ${sample.sampleNo} ${(sample.styleName||"").toUpperCase()}
+
+**Tech Pack** | ${sample.season||""} | ${date}
+
+---
+
+## Sample Information
+
+| Field | Value |
+|---|---|
+| Sample No | ${sample.sampleNo||"--"} |
+| Style Name | ${sample.styleName||"--"} |
+| Brand | ${sample.brand||"--"} |
+| Category | ${sample.cat||"--"} |
+| Sample Size | ${sample.sz||"--"} |
+| Season | ${sample.season||"--"} |
+| Colorway | ${sample.colorway||"--"} |
+| Date | ${date} |
+
+---
+
+## Design Description
+
+${sample.desc||"--"}
+
+---
+
+## Technical Sketch Notes
+
+${tp.skDesc||"See attached sketch files."}
+
+---
+
+## 3D Mockup Description
+
+${tp.mkDesc||"See attached mockup files."}`;
+
+  if(tp.inspoAnalysis){
+    md+=`\n\n---\n\n## Inspiration Image Analysis\n\n${tp.inspoAnalysis}`;
+  }
+  if(tp.callouts&&tp.callouts.some(c=>c.desc)){
+    md+=`\n\n---\n\n## Detail Callouts\n\n`;
+    tp.callouts.filter(c=>c.desc).forEach(c=>{md+=`**${c.label.toUpperCase()}:** ${c.desc}\n\n`;});
+  }
+  md+=`\n\n---\n\n## Factory Notes\n\n${tp.notes||"--"}`;
+  if(tp.chart){
+    md+=`\n\n---\n\n## Recommended Size Chart\n\n**${tp.chart.name}** (${tp.chart.code}) — sizes ${tp.chart.sizes}\n\n**Sample Size:** ${sample.sz||"--"}`;
+  }
+  md+=`\n\n---\n\n*Generated by FROO.studio Tech Pack Bot*`;
+  return md;
+}
+
+// --- CSS ---
 const CSS=`
 body{background:#080808;color:#ede9e3;font-family:'DM Mono',monospace;font-size:12px}
-.app{min-height:100vh;display:flex;flex-direction:column}
-.topbar{display:flex;align-items:center;gap:20px;padding:0 24px;height:54px;border-bottom:1px solid #161616;background:#080808;position:sticky;top:0;z-index:200}
-.logo{font-family:'Cormorant Garamond',serif;font-size:20px;font-weight:300;letter-spacing:.18em;white-space:nowrap;flex-shrink:0}
+.app{display:flex;flex-direction:column;height:100vh;overflow:hidden}
+.topbar{display:flex;align-items:center;gap:16px;padding:0 24px;height:54px;border-bottom:1px solid #161616;background:#080808;flex-shrink:0}
+.logo{font-family:'Cormorant Garamond',serif;font-size:20px;font-weight:300;letter-spacing:.18em;white-space:nowrap}
 .logo em{color:${G};font-style:normal}
-.sbar{display:flex;flex:1;overflow:hidden}
-.si{flex:1;padding:5px 3px;text-align:center;font-size:7px;letter-spacing:.08em;color:#2a2a2a;border-bottom:2px solid #161616;text-transform:uppercase;transition:all .25s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.si.done{color:#444;border-bottom-color:#282828}
-.si.active{color:${G};border-bottom-color:${G}}
-.newbtn{margin-left:auto;background:${G};color:#080808;border:none;padding:7px 16px;font-family:'DM Mono',monospace;font-size:9px;letter-spacing:.12em;cursor:pointer;text-transform:uppercase;flex-shrink:0;transition:background .2s}
-.newbtn:hover{background:#dbb87a}
-.layout{display:flex;flex:1}
-.sidebar{width:220px;min-width:220px;border-right:1px solid #161616;padding:20px 16px;display:flex;flex-direction:column;gap:16px;overflow-y:auto;max-height:calc(100vh - 54px)}
-.main{flex:1;padding:28px 36px;overflow-y:auto;max-height:calc(100vh - 54px)}
-.sblbl{font-size:7px;letter-spacing:.18em;color:#333;text-transform:uppercase;margin-bottom:7px}
-.sbrow{display:flex;justify-content:space-between;align-items:center;padding:5px 8px;background:#0d0d0d;border:1px solid #141414;margin-bottom:2px}
-.sbk{font-size:7px;color:#363636;letter-spacing:.1em;text-transform:uppercase}
-.sbv{font-size:10px;color:${G};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:105px}
-.cli{display:flex;align-items:center;gap:7px;padding:4px 0;font-size:9px}
-.cli.done{color:#4caf50}.cli.pending{color:#272727}
-.sbimg{width:100%;max-height:100px;object-fit:cover;border:1px solid #161616;margin-top:3px;display:block}
-.prog{height:1px;background:#161616;margin-bottom:24px}
-.progf{height:100%;background:${G};transition:width .5s ease}
-.sh{font-family:'Cormorant Garamond',serif;font-size:28px;font-weight:300;letter-spacing:.04em;margin-bottom:3px}
-.ss{font-size:8px;color:#333;letter-spacing:.14em;text-transform:uppercase;margin-bottom:24px}
-.card{background:#0d0d0d;border:1px solid #161616;padding:20px;margin-bottom:14px}
-.card.ok{border-color:#4caf5022}.card.gold{border-color:${G}33}
-.ch{font-size:8px;letter-spacing:.2em;color:${G};text-transform:uppercase;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center}
-.field{margin-bottom:14px}
-.lbl{display:block;font-size:7px;letter-spacing:.16em;color:#444;text-transform:uppercase;margin-bottom:5px}
-textarea,input[type=text],input[type=email],select{width:100%;background:#080808;border:1px solid #1e1e1e;color:#ede9e3;font-family:'DM Mono',monospace;font-size:11px;padding:8px 10px;outline:none;resize:vertical;transition:border .2s;line-height:1.6}
-textarea:focus,input:focus,select:focus{border-color:${G}}
-.g2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px}
-.tag{padding:5px 11px;border:1px solid #1e1e1e;font-size:8px;cursor:pointer;transition:all .2s;letter-spacing:.07em;user-select:none}
-.tag:hover{border-color:${G};color:${G}}.tag.on{background:${G};color:#080808;border-color:${G}}
-.btn{padding:8px 18px;font-family:'DM Mono',monospace;font-size:8px;letter-spacing:.14em;cursor:pointer;text-transform:uppercase;border:none;transition:all .2s;display:inline-flex;align-items:center;gap:6px}
-.btn:disabled{opacity:.3;cursor:not-allowed}
-.btn-g{background:${G};color:#080808}.btn-g:hover:not(:disabled){background:#dbb87a}
-.btn-o{background:transparent;color:${G};border:1px solid ${G}}.btn-o:hover:not(:disabled){background:${G}18}
-.btn-gh{background:transparent;color:#484848;border:1px solid #1e1e1e}.btn-gh:hover:not(:disabled){border-color:#484848;color:#777}
-.brow{display:flex;gap:8px;align-items:center;margin-top:18px;flex-wrap:wrap}
-.uzone{border:1px dashed #1e1e1e;padding:22px;text-align:center;cursor:pointer;transition:all .2s;position:relative;overflow:hidden}
-.uzone:hover{border-color:${G};background:#0b0b0b}
-.uzone input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
-.uico{font-size:18px;opacity:.2;margin-bottom:6px}
-.utxt{font-size:8px;color:#333;letter-spacing:.1em}
-.uprev{width:100%;max-height:140px;object-fit:contain;border:1px solid #161616;margin-top:8px;display:block}
-.abox{background:#0a0a0a;border-left:2px solid ${G};padding:11px 14px;margin:10px 0;font-size:10px;line-height:1.9;color:#999}
-.abox .al{font-size:7px;letter-spacing:.2em;color:${G};margin-bottom:5px;text-transform:uppercase}
-.abox.green{border-left-color:#4caf50}.abox.green .al{color:#4caf50}
-.abox.red{border-left-color:#ff5252}.abox.red .al{color:#ff5252}
-.ldr{display:flex;align-items:center;gap:8px;font-size:9px;color:#363636;margin:8px 0}
-.dts{display:flex;gap:3px}.dts span{width:4px;height:4px;background:${G};border-radius:50%;animation:dp 1.2s ease-in-out infinite}
-.dts span:nth-child(2){animation-delay:.2s}.dts span:nth-child(3){animation-delay:.4s}
+.logo-sub{font-size:8px;color:#2a2a2a;letter-spacing:.2em;text-transform:uppercase;margin-left:8px}
+.body{display:flex;flex:1;overflow:hidden}
+.sidebar{width:230px;min-width:230px;border-right:1px solid #161616;display:flex;flex-direction:column;overflow:hidden;flex-shrink:0}
+.sb-hdr{padding:12px 16px;border-bottom:1px solid #161616;font-size:7px;letter-spacing:.2em;color:#333;text-transform:uppercase;display:flex;justify-content:space-between;align-items:center}
+.sb-count{background:#1e1e1e;color:#555;padding:2px 6px;font-size:7px}
+.queue{flex:1;overflow-y:auto;padding:6px}
+.sq-empty{padding:16px 12px;font-size:9px;color:#2a2a2a;line-height:2}
+.sq-item{padding:10px 12px;border:1px solid #161616;margin-bottom:5px;cursor:pointer;transition:all .2s}
+.sq-item:hover{border-color:#252525;background:#0a0a0a}
+.sq-item.active{border-color:${G}44;background:${G}08}
+.sq-item.done{border-color:#4caf5022}
+.sq-item.error{border-color:#ff525222}
+.sq-no{font-size:9px;color:${G};letter-spacing:.1em;margin-bottom:2px}
+.sq-name{font-size:10px;color:#ede9e3;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sq-row{display:flex;justify-content:space-between;align-items:center}
+.sq-brand{font-size:7px;color:#363636;letter-spacing:.08em}
+.sq-st{font-size:7px;letter-spacing:.1em;text-transform:uppercase}
+.sq-st.processing{color:#ff9800}
+.sq-st.done{color:#4caf50}
+.sq-st.error{color:#ff5252}
+.sq-st.pending{color:#2a2a2a}
+.chat{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.msgs{flex:1;overflow-y:auto;padding:28px 32px;display:flex;flex-direction:column;gap:14px}
+.msg{display:flex;gap:10px}
+.msg.user{justify-content:flex-end}
+.msg.system{justify-content:center}
+.msg-avatar{width:26px;height:26px;border-radius:0;background:#111;border:1px solid #1e1e1e;display:flex;align-items:center;justify-content:center;font-size:9px;flex-shrink:0;margin-top:18px;letter-spacing:.05em}
+.msg-wrap{max-width:660px;min-width:0}
+.msg-label{font-size:7px;letter-spacing:.2em;text-transform:uppercase;margin-bottom:5px;color:#2a2a2a}
+.msg.bot .msg-label{color:${G}44}
+.msg.user .msg-label{color:#363636;text-align:right}
+.msg-bubble{padding:12px 16px;border:1px solid;line-height:1.9;font-size:11px;white-space:pre-wrap;word-break:break-word}
+.msg.bot .msg-bubble{background:#0d0d0d;border-color:#1a1a1a;color:#888}
+.msg.user .msg-bubble{background:${G}0d;border-color:${G}33;color:#ede9e3}
+.msg.system .msg-bubble{background:transparent;border-color:#141414;color:#2a2a2a;font-size:8px;padding:4px 12px}
+.msg-time{font-size:7px;color:#1e1e1e;margin-top:4px;letter-spacing:.06em}
+.msg.user .msg-time{text-align:right}
+.steps{margin-top:10px;border-top:1px solid #161616;padding-top:8px}
+.step-row{display:flex;gap:8px;align-items:baseline;padding:3px 0;font-size:9px;color:#333}
+.step-row.done{color:#4caf5066}
+.step-row.active{color:#ff9800}
+.step-row.error{color:#ff525266}
+.step-icon{width:10px;flex-shrink:0;text-align:center}
+.dots-wrap{display:flex;gap:3px;align-items:center}
+.dts span{width:4px;height:4px;background:${G};border-radius:50%;display:inline-block;animation:dp 1.2s ease-in-out infinite}
+.dts span:nth-child(2){animation-delay:.2s}
+.dts span:nth-child(3){animation-delay:.4s}
+.input-bar{padding:14px 20px;border-top:1px solid #161616;display:flex;gap:8px;flex-shrink:0;background:#080808}
+.chat-input{flex:1;background:#0d0d0d;border:1px solid #1a1a1a;color:#ede9e3;font-family:'DM Mono',monospace;font-size:11px;padding:10px 14px;outline:none;transition:border .2s}
+.chat-input:focus{border-color:${G}44}
+.chat-input::placeholder{color:#2a2a2a}
+.send-btn{background:${G};color:#080808;border:none;padding:10px 20px;font-family:'DM Mono',monospace;font-size:8px;letter-spacing:.12em;cursor:pointer;text-transform:uppercase;transition:background .2s;white-space:nowrap;flex-shrink:0}
+.send-btn:hover{background:#dbb87a}
+.send-btn:disabled{opacity:.25;cursor:not-allowed}
+.status-bar{display:flex;align-items:center;gap:12px;margin-left:auto}
+.status-dot{width:6px;height:6px;border-radius:50%;background:#1e1e1e;flex-shrink:0}
+.status-dot.active{background:#4caf50;animation:pulse 2s infinite}
+.status-txt{font-size:8px;color:#2a2a2a;letter-spacing:.08em}
+.status-txt.active{color:#4caf5066}
+.api-chip{font-size:7px;letter-spacing:.08em;padding:2px 7px;border:1px solid}
+.api-chip.ok{color:#4caf5066;border-color:#4caf5022}
+.api-chip.no{color:#ff525266;border-color:#ff525222}
+@keyframes pulse{0%,100%{opacity:.4}50%{opacity:1}}
 @keyframes dp{0%,80%,100%{opacity:.12}40%{opacity:1}}
-.scg{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:7px;margin-top:8px}
-.scc{border:1px solid #1e1e1e;padding:10px;cursor:pointer;transition:all .2s}
-.scc:hover{border-color:${G}44}.scc.on{border-color:${G};background:${G}0d}
-.scn{font-size:10px;color:#ede9e3;margin-bottom:2px}
-.scc2{font-size:7px;color:${G};letter-spacing:.1em}
-.scs{font-size:7px;color:#363636;margin-top:2px}
-.scai{font-size:7px;color:${G};margin-top:3px}
-.sztbl{width:100%;border-collapse:collapse;font-size:8px;min-width:360px}
-.sztbl th{background:#141414;padding:4px 6px;font-weight:400;color:#444;font-size:7px;text-transform:uppercase}
-.sztbl th.sp{background:${G};color:#080808;font-weight:600}
-.sztbl td{padding:4px 6px;border-bottom:1px solid #141414;color:#888}
-.sztbl td.sp{background:${G}12;color:${G};font-weight:600}
-.sztbl td.mn{color:#bbb;font-size:8px}.sztbl td.dn{color:#444;font-size:7px}
-.sztbl tr:nth-child(even) td{background:#0a0a0a}
-.igrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
-.ibox{border:1px solid #1e1e1e;background:#0a0a0a;overflow:hidden}
-.ibox img{width:100%;display:block;max-height:240px;object-fit:contain;background:#0d0d0d}
-.ilbl{font-size:7px;letter-spacing:.13em;color:#444;text-transform:uppercase;padding:5px 8px;border-top:1px solid #161616;text-align:center}
-.cgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:7px;margin-top:8px}
-.cbox{border:1px solid #1e1e1e;background:#0a0a0a;overflow:hidden}
-.cbox img{width:100%;max-height:100px;object-fit:cover;display:block}
-.clbl{font-size:7px;color:${G};padding:4px 7px;letter-spacing:.1em;text-transform:uppercase}
-.cdesc{font-size:7px;color:#555;padding:0 7px 6px;line-height:1.5}
-.sbadge{display:inline-block;padding:2px 7px;font-size:7px;letter-spacing:.1em;text-transform:uppercase;border:1px solid}
-.sbadge.pending{color:${G};border-color:${G}44}
-.sbadge.generating{color:#ff9800;border-color:#ff980044;animation:pulse 1s infinite}
-.sbadge.done,.sbadge.approved{color:#4caf50;border-color:#4caf5044}
-.sbadge.error{color:#ff5252;border-color:#ff525244}
-@keyframes pulse{0%,100%{opacity:.6}50%{opacity:1}}
-.hdiv{height:1px;background:#141414;margin:16px 0}
-.snav{display:flex;justify-content:space-between;align-items:center;margin-top:22px;padding-top:16px;border-top:1px solid #141414}
-.frow{display:flex;align-items:center;gap:8px;padding:7px 10px;border:1px solid #161616;margin-bottom:4px}
-.frow input[type=checkbox]{width:13px;height:13px;accent-color:${G};cursor:pointer;flex-shrink:0}
-.fn{font-size:10px;color:#ede9e3}.fe{font-size:8px;color:#444}
-.ftag{font-size:7px;padding:2px 5px;border:1px solid #202020;color:#444;margin-left:2px}
-.sst{padding:10px 14px;border:1px solid;margin-top:10px;font-size:10px}
-.sst.ok{border-color:#4caf5033;background:#4caf5008;color:#4caf50}
-.tp{background:#fff;color:#111;font-family:'DM Mono',monospace;font-size:9px;border:1px solid #ddd}
-.tpp{padding:22px 26px;border-bottom:2px solid #e0e0e0}
-.tpp:last-child{border-bottom:none}
-.tphdr{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:16px;padding-bottom:10px;border-bottom:2px solid #111}
-.tpbrand{font-family:'Cormorant Garamond',serif;font-size:15px;font-weight:600;letter-spacing:.1em}
-.tpref{font-size:7px;color:#999;letter-spacing:.14em;text-transform:uppercase}
-.tpmeta{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:#e0e0e0;margin-bottom:13px;border:1px solid #e0e0e0}
-.tpmc{background:#fff;padding:5px 8px}
-.tpmk{font-size:6px;color:#bbb;letter-spacing:.12em;text-transform:uppercase;margin-bottom:1px}
-.tpmv{font-size:9px;color:#111}
-.tpsh{font-size:7px;letter-spacing:.18em;text-transform:uppercase;color:#bbb;margin:11px 0 6px;padding-bottom:5px;border-bottom:1px solid #ececec}
-.tpimgs{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:11px}
-.tpib{border:1px solid #ececec;padding:4px;background:#fafafa;text-align:center}
-.tpib img{max-height:120px;max-width:100%;object-fit:contain;display:block;margin:0 auto}
-.tpibph{height:100px;background:#f5f5f5;display:flex;align-items:center;justify-content:center;color:#ddd;font-size:7px;text-transform:uppercase}
-.tpilbl{font-size:6px;color:#ccc;text-transform:uppercase;letter-spacing:.1em;margin-top:3px}
-.tpnotes{font-size:9px;line-height:2;color:#333;white-space:pre-wrap}
-.tpfrow{display:grid;grid-template-columns:85px 1fr;gap:11px;margin-bottom:11px;border:1px solid #ececec;padding:9px}
-.tpfimg{width:85px;height:65px;border:1px solid #ececec;background:#f5f5f5;display:flex;align-items:center;justify-content:center;font-size:7px;color:#ddd;overflow:hidden;flex-shrink:0}
-.tpfimg img{width:100%;height:100%;object-fit:cover}
-.tpsup{font-size:9px;line-height:2;color:#444}
-.tpsup strong{color:#111}
-.tpsztbl{width:100%;border-collapse:collapse;font-size:7px}
-.tpsztbl th{background:#f5f5f5;padding:3px 5px;font-weight:500;border:1px solid #e8e8e8;text-align:center;color:#888;font-size:6px}
-.tpsztbl th.sp{background:#111;color:#fff}
-.tpsztbl td{padding:3px 5px;border:1px solid #e8e8e8;text-align:center;color:#555}
-.tpsztbl td.sp{background:#f0f0f0;font-weight:600;color:#111}
-.tpsztbl td.ml{text-align:left;color:#333}
-.connstat{font-size:9px;line-height:2.2}
-.connstat .ok{color:#4caf50}.connstat .no{color:#ff5252}.connstat .warn{color:#ff9800}
 `;
 
-function Loader({text}){text=text||"Processing...";
-  return React.createElement("div",{className:"ldr"},
-    React.createElement("div",{className:"dts"},
-      React.createElement("span"),React.createElement("span"),React.createElement("span")),
-    React.createElement("span",null,text));
-}
-function Badge({s}){
-  const m={idle:"pending",generating:"generating",done:"done",approved:"approved",error:"error",sent:"done",pending:"pending"};
-  return React.createElement("span",{className:"sbadge "+(m[s]||"pending")},s);
-}
-function Upload({label,onFile,preview,hint}){
-  hint=hint||"Click or drag to upload";
-  return React.createElement("div",{className:"field"},
-    label&&React.createElement("label",{className:"lbl"},label),
-    React.createElement("div",{className:"uzone"},
-      React.createElement("input",{type:"file",accept:"image/*",onChange:e=>e.target.files[0]&&onFile(e.target.files[0])}),
-      preview
-        ?React.createElement("img",{src:preview,className:"uprev",alt:""})
-        :React.createElement(React.Fragment,null,
-          React.createElement("div",{className:"uico"},"\u2191"),
-          React.createElement("div",{className:"utxt"},hint))));
-}
-function SzTable({data,sz}){
-  if(!data||!data.rows||!data.rows.length)return null;
-  const{rows,sizes}=data;
-  const isSp=s=>isSampleSize(s,sz);
-  return React.createElement("div",{style:{overflowX:"auto",marginTop:10}},
-    React.createElement("table",{className:"sztbl"},
-      React.createElement("thead",null,React.createElement("tr",null,
-        React.createElement("th",{style:{textAlign:"left"}},"Measurement"),
-        React.createElement("th",{style:{textAlign:"left",color:"#333"}},"Description"),
-        sizes.map(s=>React.createElement("th",{key:s,className:isSp(s)?"sp":""},s)))),
-      React.createElement("tbody",null,rows.map((row,i)=>
-        React.createElement("tr",{key:i},
-          React.createElement("td",{className:"mn"},row.measurement),
-          React.createElement("td",{className:"dn"},row.description||"--"),
-          sizes.map(s=>React.createElement("td",{key:s,className:isSp(s)?"sp":""},row.sizes[s]||"--")))))),
-    React.createElement("div",{style:{fontSize:7,color:"#363636",marginTop:5}},"* Sample size "+sz+" highlighted - all measurements in cm"));
+// --- COMPONENTS ---
+function Dots(){
+  return <div className="dts"><span/><span/><span/></div>;
 }
 
-// ---- STEP COMPONENTS ----
+const STEP_DEFS=[
+  {key:"sketch",label:"Build sketch prompt"},
+  {key:"descriptions",label:"Generate technical descriptions"},
+  {key:"image",label:"Analyse inspiration image"},
+  {key:"chart",label:"Select size chart"},
+  {key:"notes",label:"Generate factory notes"},
+  {key:"channel",label:"Create Slack channel"},
+  {key:"canvas",label:"Create canvas & post"},
+];
 
-function S1({s,set,next}){
-  const[loading,setLoading]=useState(false);
-  async function analyse(){
-    setLoading(true);
-    try{
-      let msgs;
-      if(s.inspoFile){
-        const b64=await fileToB64(s.inspoFile);
-        msgs=[{role:"user",content:[
-          {type:"image",source:{type:"base64",media_type:s.inspoFile.type,data:b64}},
-          {type:"text",text:'Style: "'+s.desc+'"\nAnalyse this inspo image and description. List 4 specific factory clarification questions about construction, closures, trim, finish. Be brief and numbered.'}]}];
-      }else{
-        msgs=[{role:"user",content:'Style: "'+s.desc+'"\nList 4 specific factory clarification questions about construction, closures, trim, finish. Be brief and numbered.'}];
-      }
-      set("clarify",await callClaude(msgs));
-    }catch(e){set("clarify","AI unavailable. Fill details manually.");}
-    setLoading(false);
-  }
-  return(
-    <div>
-      <div className="sh">Style Brief</div>
-      <div className="ss">Step 01 - Describe the style and upload reference images</div>
-      <div className="card">
-        <div className="ch">Style Description</div>
-        <div className="field">
-          <label className="lbl">Describe the style in detail</label>
-          <textarea rows={5} placeholder="e.g. Girls midi dress, Peter Pan collar, puff sleeves, button-front, blue stripe cotton, elastic back waist, 4 pearl buttons, fully lined bodice..." value={s.desc} onChange={e=>set("desc",e.target.value)}/>
-        </div>
-      </div>
-      <div className="g2">
-        <div className="card">
-          <div className="ch">Inspiration Image</div>
-          <Upload onFile={f=>{set("inspoFile",f);set("inspoPrev",URL.createObjectURL(f));}} preview={s.inspoPrev} hint="Upload inspiration photo"/>
-        </div>
-        <div className="card">
-          <div className="ch">Fabric Card (optional)</div>
-          <Upload onFile={f=>{set("fabFile",f);set("fabPrev",URL.createObjectURL(f));}} preview={s.fabPrev} hint="Upload if available"/>
-        </div>
-      </div>
-      {s.desc&&!s.clarify&&(
-        <div className="brow">
-          <button className="btn btn-o" onClick={analyse} disabled={loading}>{loading?"Analysing...":"Analyse Style"}</button>
-          {loading&&<Loader/>}
-        </div>
-      )}
-      {s.clarify&&<div className="abox"><div className="al">Design Clarifications Needed</div>{s.clarify}</div>}
-      <div className="snav"><div/><button className="btn btn-g" onClick={next} disabled={!s.desc}>Next</button></div>
+function MsgBubble({msg}){
+  const time=new Date(msg.ts).toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"});
+  if(msg.role==="system")return(
+    <div className="msg system">
+      <div className="msg-bubble">{msg.text}</div>
     </div>
   );
-}
-
-function S2({s,set,back,next}){
-  const[loading,setLoading]=useState(false);
-  async function genNotes(){
-    setLoading(true);
-    try{
-      const r=await callClaude([{role:"user",content:"Generate 10 precise factory bullet-point notes for:\nStyle: "+s.styleName+" ("+s.sampleNo+")\nBrand: "+s.brand+" | "+s.cat+" | Size "+s.sz+" | "+s.season+"\nColorway: "+s.colorway+"\nDescription: "+s.desc+"\nExtra: "+s.answers+"\nCover: silhouette, fabric, construction, closures, trims, hem, special details. Technical and specific. Number each point."}]);
-      set("notes",r);
-    }catch(e){set("notes","Could not generate. Write manually.");}
-    setLoading(false);
-  }
-  const sizes=SAMPLE_SIZES[s.cat]||[];
-  const ok=s.brand&&s.cat&&s.sz&&s.styleName&&s.sampleNo;
+  const isBot=msg.role==="bot";
+  const activeSteps=msg.steps&&msg.steps.length>0;
   return(
-    <div>
-      <div className="sh">Brand & Size</div>
-      <div className="ss">Step 02 - Set brand, category and sample details</div>
-      <div className="card"><div className="ch">Brand</div>
-        <div className="tags">{BRANDS.map(b=><div key={b} className={"tag"+(s.brand===b?" on":"")} onClick={()=>set("brand",b)}>{b}</div>)}</div>
-      </div>
-      <div className="card"><div className="ch">Category</div>
-        <div className="tags">{CATEGORIES.map(c=><div key={c} className={"tag"+(s.cat===c?" on":"")} onClick={()=>{set("cat",c);set("sz","");}}>{c}</div>)}</div>
-      </div>
-      {s.cat&&<div className="card"><div className="ch">Sample Size</div>
-        <div className="tags">{sizes.map(sz=><div key={sz} className={"tag"+(s.sz===sz?" on":"")} onClick={()=>set("sz",sz)}>{sz}</div>)}</div>
-      </div>}
-      <div className="card">
-        <div className="ch">Style Details</div>
-        <div className="g2">
-          <div className="field"><label className="lbl">Style Name</label><input type="text" placeholder="e.g. Lily Dress" value={s.styleName} onChange={e=>set("styleName",e.target.value)}/></div>
-          <div className="field"><label className="lbl">Sample Number</label><input type="text" placeholder="e.g. B106" value={s.sampleNo} onChange={e=>set("sampleNo",e.target.value)}/></div>
-          <div className="field"><label className="lbl">Season</label><input type="text" placeholder="e.g. SS27" value={s.season} onChange={e=>set("season",e.target.value)}/></div>
-          <div className="field"><label className="lbl">Colorway</label><input type="text" placeholder="e.g. White / Blue Stripe" value={s.colorway} onChange={e=>set("colorway",e.target.value)}/></div>
-        </div>
-      </div>
-      <div className="card">
-        <div className="ch">Clarifications & Notes</div>
-        <div className="field"><label className="lbl">Answer clarifications or add extra notes</label>
-          <textarea rows={4} placeholder="e.g. Fully lined, invisible CB zip, 4 pearl buttons, piping in contrast navy..." value={s.answers} onChange={e=>set("answers",e.target.value)}/>
-        </div>
-        <button className="btn btn-o" onClick={genNotes} disabled={loading||!s.brand||!s.cat}>{loading?"Generating...":"Generate Factory Notes"}</button>
-        {loading&&<Loader/>}
-        {s.notes&&<div style={{marginTop:12}}>
-          <label className="lbl">Factory Notes (edit as needed)</label>
-          <textarea rows={8} value={s.notes} onChange={e=>set("notes",e.target.value)}/>
-        </div>}
-      </div>
-      <div className="snav">
-        <button className="btn btn-gh" onClick={back}>Back</button>
-        <button className="btn btn-g" onClick={next} disabled={!ok}>Next</button>
-      </div>
-    </div>
-  );
-}
-
-function S3({s,set,back,next}){
-  const[mode,setMode]=useState(s.fabFile?"card":"");
-  const[loading,setLoading]=useState(false);
-  const[trimFile,setTrimFile]=useState(null);
-  async function suggest(){
-    setLoading(true);
-    try{
-      const r=await callClaude([{role:"user",content:"Fabric for kidswear:\nStyle: "+s.desc+"\nCategory: "+s.cat+", Brand: "+s.brand+"\nRequest: "+(s.fabDesc||"not specified")+"\n\nSuggest:\n1. Fabric name & composition\n2. Weight (gsm)\n3. Why it suits this style\n4. Guangzhou market source\n5. Price per metre\nMax 90 words."}]);
-      set("fabSuggest",r);
-      set("suppInfo","Wanda Textile\nGuangzhou Haizhu District, Zhongda Changjiang International Textile City, Ring Road B018\nTel: 020-3432 8660 | M: 139 2235 7062");
-    }catch(e){set("fabSuggest","Could not generate suggestion.");}
-    setLoading(false);
-  }
-  return(
-    <div>
-      <div className="sh">Fabric</div>
-      <div className="ss">Step 03 - Confirm or source fabric and trims</div>
-      {s.fabFile?(
-        <div className="card ok">
-          <div className="ch">Fabric Card Uploaded</div>
-          <div className="g2">
-            <img src={s.fabPrev} style={{width:"100%",maxHeight:160,objectFit:"contain",border:"1px solid #161616"}}/>
-            <div>
-              <div className="field"><label className="lbl">Fabric details</label>
-                <textarea rows={4} placeholder="Article, composition, weight, width, colour" value={s.fabDesc} onChange={e=>set("fabDesc",e.target.value)}/></div>
-              <div className="field"><label className="lbl">Supplier contact</label>
-                <textarea rows={3} placeholder="Supplier name, address, contact" value={s.suppInfo} onChange={e=>set("suppInfo",e.target.value)}/></div>
-              {!s.fabApproved
-                ?<button className="btn btn-g" onClick={()=>set("fabApproved",true)}>Approve Fabric</button>
-                :<div style={{color:"#4caf50",fontSize:10}}>Fabric approved</div>}
-            </div>
-          </div>
-        </div>
-      ):(
-        <div className="card">
-          <div className="ch">No Fabric Card - How to proceed?</div>
-          <div className="tags" style={{marginBottom:14}}>
-            {[{k:"upload",l:"Upload fabric image"},{k:"describe",l:"Describe fabric"},{k:"source",l:"Source for me"}].map(({k,l})=>(
-              <div key={k} className={"tag"+(mode===k?" on":"")} onClick={()=>setMode(k)}>{l}</div>
-            ))}
-          </div>
-          {mode==="upload"&&<Upload onFile={f=>{set("fabFile",f);set("fabPrev",URL.createObjectURL(f));}} hint="Upload fabric swatch or card"/>}
-          {(mode==="describe"||mode==="source")&&(
-            <div className="field"><label className="lbl">Describe the fabric needed</label>
-              <textarea rows={3} placeholder="e.g. Soft white cotton shirting, lightweight..." value={s.fabDesc} onChange={e=>set("fabDesc",e.target.value)}/></div>
-          )}
-          {(mode==="describe"||mode==="source")&&s.fabDesc&&(
-            <button className="btn btn-o" onClick={suggest} disabled={loading}>{loading?"Sourcing...":"Get Fabric Suggestion"}</button>
-          )}
-          {loading&&<Loader text="Sourcing fabric..."/>}
-          {s.fabSuggest&&<>
-            <div className="abox"><div className="al">Fabric Suggestion</div>{s.fabSuggest}</div>
-            {s.suppInfo&&<div className="abox green"><div className="al">Suggested Supplier</div>{s.suppInfo}</div>}
-            {!s.fabApproved
-              ?<button className="btn btn-g" style={{marginTop:10}} onClick={()=>set("fabApproved",true)}>Approve for Tech Pack</button>
-              :<div style={{color:"#4caf50",fontSize:10,marginTop:8}}>Approved</div>}
-          </>}
-        </div>
-      )}
-      <div className="card">
-        <div className="ch">Trim Fabrics (optional)</div>
-        <p style={{fontSize:10,color:"#444",marginBottom:10,lineHeight:1.8}}>Lining, piping, lace, elastic or secondary fabrics.</p>
-        <Upload label="Trim fabric card" onFile={f=>{setTrimFile(f);set("trimPrev",URL.createObjectURL(f));}} preview={s.trimPrev} hint="Upload trim fabric card"/>
-        {trimFile&&<div className="field" style={{marginTop:8}}><label className="lbl">Trim details</label>
-          <textarea rows={2} placeholder="e.g. Light blue rolled piping, 0.5cm..." value={s.trimDesc} onChange={e=>set("trimDesc",e.target.value)}/></div>}
-      </div>
-      <div className="snav">
-        <button className="btn btn-gh" onClick={back}>Back</button>
-        <button className="btn btn-g" onClick={next}>Next</button>
-      </div>
-    </div>
-  );
-}
-
-function S4({s,set,back,next}){
-  const[mode,setMode]=useState("");
-  const[search,setSearch]=useState("");
-  const[suggests,setSuggests]=useState([]);
-  const[dbLoading,setDbLoading]=useState(false);
-  const[dbErr,setDbErr]=useState("");
-  const[matchLoad,setMatchLoad]=useState(false);
-  const[qa,setQa]=useState({});
-  const[matched,setMatched]=useState(null);
-  useEffect(()=>{
-    const rule=guessBody(s.desc+" "+s.styleName);
-    if(rule){
-      const f=filterCat(rule.codes,s.cat);
-      setSuggests(f.map(c=>CHART_LIB.find(x=>x.code===c)).filter(Boolean).slice(0,3));
-    }
-  },[s.desc,s.styleName]);
-  async function pullDB(chart){
-    set("chart",chart);set("chartData",null);setDbErr("");setDbLoading(true);
-    try{
-      const data=await supabaseFetch("size_charts",{style_code:chart.code});
-      if(data&&data.length){
-        const grp={};
-        data.forEach(r=>{
-          if(!grp[r.measurement])grp[r.measurement]={measurement:r.measurement,description:r.description,sizes:{}};
-          grp[r.measurement].sizes[r.size]=r.value_cm;
-        });
-        set("chartData",{rows:Object.values(grp),sizes:[...new Set(data.map(r=>r.size))],chart});
-      }else setDbErr("No data in Supabase for this chart. Upload manually or check connection.");
-    }catch(e){setDbErr("Supabase error: "+e.message);}
-    setDbLoading(false);
-  }
-  async function matchBlock(){
-    setMatchLoad(true);
-    const text=(qa.garmentType||"")+" "+(qa.fabricType||"")+" "+s.desc;
-    const rule=guessBody(text)||BLOCK_RULES[0];
-    const filtered=filterCat(rule.codes,s.cat);
-    const code=filtered[0]||rule.codes[0];
-    const chart=CHART_LIB.find(x=>x.code===code)||CHART_LIB[0];
-    setMatched(chart);
-    await pullDB(chart);
-    setMatchLoad(false);
-  }
-  const filtered=CHART_LIB.filter(c=>!search||c.name.toLowerCase().includes(search.toLowerCase())||c.code.toLowerCase().includes(search.toLowerCase()));
-  const ready=!!s.chart||!!s.chartFile;
-  return(
-    <div>
-      <div className="sh">Size Chart</div>
-      <div className="ss">Step 04 - Pull from Supabase or build from size blocks</div>
-      {suggests.length>0&&!mode&&(
-        <div className="card gold">
-          <div className="ch">Suggested Based on Your Style</div>
-          <p style={{fontSize:10,color:"#444",marginBottom:10,lineHeight:1.8}}>Based on "{(s.desc||"").slice(0,50)}..."</p>
-          <div className="scg">
-            {suggests.map(c=>(
-              <div key={c.code} className={"scc"+(s.chart&&s.chart.code===c.code?" on":"")} onClick={()=>pullDB(c)}>
-                <div className="scn">{c.name}</div><div className="scc2">{c.code}</div>
-                <div className="scs">{c.sizes}</div><div className="scai">AI SUGGESTED</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-      <div className="card">
-        <div className="ch">Body Type</div>
-        <div className="tags" style={{marginBottom:mode?14:0}}>
-          <div className={"tag"+(mode==="existing"?" on":"")} onClick={()=>setMode("existing")}>Existing body</div>
-          <div className={"tag"+(mode==="new"?" on":"")} onClick={()=>setMode("new")}>New body - size blocks</div>
-          <div className={"tag"+(mode==="upload"?" on":"")} onClick={()=>setMode("upload")}>Upload chart file</div>
-        </div>
-        {mode==="existing"&&<>
-          <div className="field" style={{marginTop:10}}><input type="text" placeholder="Search by name or code..." value={search} onChange={e=>setSearch(e.target.value)}/></div>
-          <div className="scg">
-            {filtered.map(c=>(
-              <div key={c.code} className={"scc"+(s.chart&&s.chart.code===c.code?" on":"")} onClick={()=>pullDB(c)}>
-                <div className="scn">{c.name}</div><div className="scc2">{c.code}</div><div className="scs">{c.sizes}</div>
-              </div>
-            ))}
-          </div>
-          {dbLoading&&<Loader text="Fetching from Supabase..."/>}
-          {dbErr&&<div className="abox red" style={{marginTop:10}}><div className="al">Error</div>{dbErr}</div>}
-          {s.chartData&&!dbLoading&&<>
-            <div className="abox green"><div className="al">Live from Supabase</div>
-              <strong>{s.chartData.chart.name}</strong> - {s.chartData.rows.length} measurements, {s.chartData.sizes.length} sizes, sample size <strong>{s.sz}</strong> highlighted
-            </div>
-            <SzTable data={s.chartData} sz={s.sz}/>
-          </>}
-        </>}
-        {mode==="new"&&<>
-          <p style={{fontSize:10,color:"#444",marginBottom:12,lineHeight:1.8,marginTop:10}}>Answer these questions to find the closest size block.</p>
-          <div className="g2">
-            {SZ_QS.map(q=>(
-              <div key={q.k} className="field">
-                <label className="lbl">{q.label}</label>
-                <div className="tags">{q.opts.map(o=><div key={o} className={"tag"+(qa[q.k]===o?" on":"")} style={{fontSize:7,padding:"4px 8px"}} onClick={()=>setQa(p=>Object.assign({},p,{[q.k]:o}))}>{o}</div>)}</div>
-              </div>
-            ))}
-          </div>
-          <div className="field"><label className="lbl">Additional notes</label><input type="text" placeholder="e.g. oversized, long torso..." value={qa.notes||""} onChange={e=>setQa(p=>Object.assign({},p,{notes:e.target.value}))}/></div>
-          <button className="btn btn-o" onClick={matchBlock} disabled={matchLoad||Object.keys(qa).length<2}>{matchLoad?"Matching...":"Find Closest Size Block"}</button>
-          {matchLoad&&<Loader text="Matching size block..."/>}
-          {matched&&!matchLoad&&<>
-            <div className="abox"><div className="al">Closest Match</div>Based on {qa.garmentType}, {qa.fabricType}, {qa.sleeve} - best match: <strong>{matched.name}</strong> ({matched.code})</div>
-            {s.chartData&&<SzTable data={s.chartData} sz={s.sz}/>}
-            <div className="brow">
-              <button className="btn btn-gh" onClick={()=>{setMatched(null);set("chart",null);set("chartData",null);}}>Try again</button>
-              <button className="btn btn-g" onClick={()=>set("chart",matched)}>Use This Chart</button>
-            </div>
-          </>}
-        </>}
-        {mode==="upload"&&<>
-          <Upload label="Upload size chart (.xlsx or .csv)" onFile={f=>set("chartFile",f)} hint="Upload chart file"/>
-          {s.chartFile&&<div style={{color:"#4caf50",fontSize:10,marginTop:6}}>{s.chartFile.name} uploaded</div>}
-        </>}
-      </div>
-      {ready&&<div className="card ok">
-        <div className="ch">Size Chart Ready</div>
-        <div style={{display:"flex",gap:18,fontSize:10,lineHeight:2,flexWrap:"wrap"}}>
-          <span>CHART: {s.chart?(s.chart.name+" ("+s.chart.code+")"):(s.chartFile&&s.chartFile.name)}</span>
-          <span>SAMPLE SIZE: <span style={{color:G,fontWeight:600}}>{s.sz}</span></span>
-          <span>SOURCE: {s.chartData?"Supabase":s.chartFile?"Uploaded":"Library"}</span>
-        </div>
-      </div>}
-      <div className="snav">
-        <button className="btn btn-gh" onClick={back}>Back</button>
-        <button className="btn btn-g" onClick={next} disabled={!ready}>Next</button>
-      </div>
-    </div>
-  );
-}
-
-function S5({s,set,back,next}){
-  const[skSt,setSkSt]=useState("idle");
-  const[mkSt,setMkSt]=useState("idle");
-  const[bgSt,setBgSt]=useState("idle");
-  const[coSt,setCoSt]=useState("idle");
-  const[prompt,setPrompt]=useState("");
-  const[buildingPrompt,setBuildingPrompt]=useState(false);
-  const details=getDetails(s.desc);
-
-  async function buildPrompt(){
-    setBuildingPrompt(true);
-    try{
-      const r=await callClaude([{role:"user",content:"Write a concise technical sketch prompt (max 80 words) for:\n"+s.styleName+" - "+s.desc+"\nBrand: "+s.brand+" | Category: "+s.cat+"\nInclude: garment type, silhouette, key construction details, front and back views. Return only the prompt text."}]);
-      setPrompt(r);
-    }catch(e){setPrompt("Technical flat sketch: "+s.styleName+". "+s.desc+". Show front and back views with all construction details.");}
-    setBuildingPrompt(false);
-  }
-  async function genSketch(){
-    if(!prompt)await buildPrompt();
-    setSkSt("generating");
-    set("skFront",PH_SKETCH_FRONT);
-    set("skBack",PH_SKETCH_BACK);
-    try{
-      const desc=await geminiText("You are a fashion technical sketch expert.\nFor this garment: "+(prompt||s.desc)+"\n\nProvide detailed technical sketch notes:\n1. FRONT VIEW - silhouette, neckline, sleeves, bodice, hemline, closures, pockets, trims\n2. BACK VIEW - back neckline, closure, back construction\n3. KEY DETAILS - seams, topstitching, gathering, pleats\nBe specific and technical for factory use. Max 200 words.");
-      set("skDescription",desc);
-    }catch(e){}
-    setSkSt("done");
-  }
-  async function genMockup(){
-    setMkSt("generating");
-    set("mkFront",PH_MOCKUP_FRONT);
-    set("mkBack",PH_MOCKUP_BACK);
-    try{
-      let desc;
-      if(s.fabFile){
-        const b64=await fileToB64(s.fabFile);
-        desc=await geminiVision(b64,s.fabFile.type,"This is a fabric swatch for: "+s.styleName+" - "+s.desc+"\nDescribe a 3D mockup on a children's mannequin:\n1. FRONT VIEW - fabric appearance, drape, colour, pattern\n2. BACK VIEW - back construction\n3. OVERALL - fit, silhouette\nMax 180 words.");
-      }else{
-        desc=await geminiText("Describe a 3D fashion mockup for: "+s.styleName+" - "+s.desc+"\n1. FRONT VIEW on mannequin\n2. BACK VIEW\n3. OVERALL impression\nMax 180 words.");
-      }
-      set("mkDescription",desc);
-    }catch(e){}
-    setMkSt("done");
-  }
-  async function cleanBg(){
-    if(!s.inspoFile)return;
-    setBgSt("generating");
-    try{
-      const b64=await fileToB64(s.inspoFile);
-      const desc=await geminiVision(b64,s.inspoFile.type,"Describe this fashion inspiration image: garment type, silhouette, colours, key design features, fabric appearance, special details like embroidery/lace/buttons. Be specific for a factory tech pack. Max 150 words.");
-      set("inspoClean",s.inspoPrev);
-      set("inspoAnalysis",desc);
-    }catch(e){set("inspoClean",s.inspoPrev);}
-    setBgSt("done");
-  }
-  async function genCallouts(){
-    if(!s.inspoFile||!details.length)return;
-    setCoSt("generating");
-    try{
-      const b64=await fileToB64(s.inspoFile);
-      const results=await Promise.all(details.slice(0,4).map(d=>
-        geminiVision(b64,s.inspoFile.type,"Focus on the "+d+" detail in this garment. Describe precisely for factory production: technique, placement, dimensions, colour, construction method. Max 80 words.")
-          .then(desc=>({label:d,description:desc,url:"https://placehold.co/200x200/0d0d0d/c9a96e?text="+encodeURIComponent(d.toUpperCase())}))
-      ));
-      set("callouts",results);
-    }catch(e){
-      set("callouts",details.slice(0,4).map(d=>({label:d,description:"",url:"https://placehold.co/200x200/0d0d0d/c9a96e?text="+encodeURIComponent(d.toUpperCase())})));
-    }
-    setCoSt("done");
-  }
-  async function generateAll(){
-    await buildPrompt();
-    const inspoTasks=s.inspoFile?[cleanBg().then(()=>details.length?genCallouts():null)]:[];
-    await Promise.all([genSketch(),genMockup(),...inspoTasks]);
-  }
-  const allDone=skSt==="done"&&mkSt==="done";
-  return(
-    <div>
-      <div className="sh">Sketch & Mockup</div>
-      <div className="ss">Step 05 - AI generates sketch, 3D mockup and image analysis</div>
-      <div className="card">
-        <div className="ch">Generation Prompt</div>
-        <p style={{fontSize:10,color:"#444",lineHeight:1.8,marginBottom:12}}>
-          Claude builds the technical brief automatically.{details.length>0&&(" Detected details: "+details.join(", ")+".")}
-        </p>
-        <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:12}}>
-          <button className="btn btn-o" onClick={buildPrompt} disabled={buildingPrompt}>{buildingPrompt?"Building...":"Build Prompt"}</button>
-          <button className="btn btn-g" onClick={generateAll} disabled={skSt==="generating"||mkSt==="generating"}>Generate All</button>
-        </div>
-        {buildingPrompt&&<Loader text="Building prompt..."/>}
-        {prompt&&<div><label className="lbl">Prompt (edit if needed)</label><textarea rows={4} value={prompt} onChange={e=>setPrompt(e.target.value)}/></div>}
-      </div>
-      <div className="g2">
-        <div className="card">
-          <div className="ch">Technical Sketch <Badge s={skSt==="idle"?"pending":skSt}/></div>
-          <button className="btn btn-o" onClick={genSketch} disabled={skSt==="generating"} style={{marginBottom:10,fontSize:8}}>{skSt==="generating"?"Generating...":"Generate Sketch"}</button>
-          {skSt==="generating"&&<Loader text="Generating sketch..."/>}
-          {s.skFront&&s.skBack&&<div className="igrid">
-            <div className="ibox"><img src={s.skFront} alt=""/><div className="ilbl">Front</div></div>
-            <div className="ibox"><img src={s.skBack} alt=""/><div className="ilbl">Back</div></div>
+    <div className={"msg "+msg.role}>
+      {isBot&&<div className="msg-avatar" style={{color:G}}>F</div>}
+      <div className="msg-wrap" style={!isBot?{marginLeft:"auto"}:{}}>
+        <div className="msg-label">{isBot?"FROO Bot":"You"}</div>
+        <div className="msg-bubble">
+          {msg.loading&&!msg.text&&<Dots/>}
+          {msg.text&&<span>{msg.text}</span>}
+          {activeSteps&&<div className="steps">
+            {STEP_DEFS.filter(d=>msg.steps[d.key]!==undefined||(msg.activeStep===d.key)).map(d=>{
+              const st=msg.steps[d.key]||"pending";
+              const isActive=msg.activeStep===d.key;
+              return(
+                <div key={d.key} className={"step-row "+(isActive?"active":st)}>
+                  <span className="step-icon">{st==="done"?"✓":isActive?"▸":"○"}</span>
+                  <span>{d.label}</span>
+                  {isActive&&<Dots/>}
+                </div>
+              );
+            })}
           </div>}
-          {s.skDescription&&<div className="abox" style={{marginTop:10}}><div className="al">Technical Sketch Notes</div>{s.skDescription}</div>}
         </div>
-        <div className="card">
-          <div className="ch">3D Mockup <Badge s={mkSt==="idle"?"pending":mkSt}/></div>
-          <button className="btn btn-o" onClick={genMockup} disabled={mkSt==="generating"} style={{marginBottom:10,fontSize:8}}>{mkSt==="generating"?"Generating...":"Generate 3D Mockup"}</button>
-          {mkSt==="generating"&&<Loader text="Generating 3D mockup..."/>}
-          {s.mkFront&&s.mkBack&&<div className="igrid">
-            <div className="ibox"><img src={s.mkFront} alt=""/><div className="ilbl">Front</div></div>
-            <div className="ibox"><img src={s.mkBack} alt=""/><div className="ilbl">Back</div></div>
-          </div>}
-          {s.mkDescription&&<div className="abox" style={{marginTop:10}}><div className="al">3D Mockup Notes</div>{s.mkDescription}</div>}
-        </div>
+        <div className="msg-time">{time}</div>
       </div>
-      {s.inspoFile&&<div className="card">
-        <div className="ch">Inspiration Image Analysis <Badge s={bgSt==="idle"?"pending":bgSt}/></div>
-        <button className="btn btn-o" onClick={cleanBg} disabled={bgSt==="generating"} style={{marginBottom:10,fontSize:8}}>{bgSt==="generating"?"Analysing...":"Analyse Inspo Image"}</button>
-        {bgSt==="generating"&&<Loader text="Analysing with Gemini..."/>}
-        <div className="igrid">
-          <div className="ibox"><img src={s.inspoPrev} alt=""/><div className="ilbl">Original</div></div>
-          <div className="ibox"><img src={s.inspoClean||s.inspoPrev} alt=""/><div className="ilbl">Analysed</div></div>
-        </div>
-        {s.inspoAnalysis&&<div className="abox green" style={{marginTop:10}}><div className="al">Image Analysis</div>{s.inspoAnalysis}</div>}
-        {details.length>0&&<div style={{marginTop:14}}>
-          <div className="ch">Detail Callouts - {details.join(", ")} <Badge s={coSt==="idle"?"pending":coSt}/></div>
-          <button className="btn btn-o" onClick={genCallouts} disabled={coSt==="generating"} style={{marginBottom:10,fontSize:8}}>{coSt==="generating"?"Analysing...":"Analyse Key Details"}</button>
-          {coSt==="generating"&&<Loader text="Analysing details with Gemini..."/>}
-          {s.callouts&&s.callouts.length>0&&<div className="cgrid">
-            {s.callouts.map((c,i)=>(
-              <div key={i} className="cbox">
-                <img src={c.url} alt={c.label}/>
-                <div className="clbl">{c.label}</div>
-                {c.description&&<div className="cdesc">{c.description.slice(0,110)}...</div>}
-              </div>
-            ))}
-          </div>}
-        </div>}
-      </div>}
-      <div className="snav">
-        <button className="btn btn-gh" onClick={back}>Back</button>
-        <button className="btn btn-g" onClick={next} disabled={!allDone}>Review & Approve</button>
-      </div>
+      {!isBot&&<div className="msg-avatar" style={{color:"#363636"}}>U</div>}
     </div>
   );
 }
 
-function S6({s,set,back,next}){
-  const[editFor,setEditFor]=useState("");
-  const[editTxt,setEditTxt]=useState("");
-  const approved=s.skApproved&&s.mkApproved;
+function SampleItem({item,active,onClick}){
   return(
-    <div>
-      <div className="sh">Approval</div>
-      <div className="ss">Step 06 - Review and approve all assets before tech pack</div>
-      <div className="card">
-        <div className="ch">Technical Sketches <Badge s={s.skApproved?"approved":"pending"}/></div>
-        <div className="igrid">
-          <div className="ibox"><img src={s.skFront||"https://placehold.co/300x380/0d0d0d/c9a96e?text=SKETCH+FRONT"} alt=""/><div className="ilbl">Front View</div></div>
-          <div className="ibox"><img src={s.skBack||"https://placehold.co/300x380/0d0d0d/c9a96e?text=SKETCH+BACK"} alt=""/><div className="ilbl">Back View</div></div>
-        </div>
-        {s.skDescription&&<div className="abox" style={{marginTop:10}}><div className="al">Sketch Notes</div>{s.skDescription}</div>}
-        <div className="brow">
-          <button className="btn btn-g" onClick={()=>set("skApproved",true)}>Approve Sketches</button>
-          <button className="btn btn-gh" onClick={()=>{setEditFor("sketch");set("skApproved",false);}}>Request Edits</button>
-          {s.skApproved&&<span style={{color:"#4caf50",fontSize:10}}>Approved</span>}
-        </div>
-      </div>
-      <div className="card">
-        <div className="ch">3D Mockups <Badge s={s.mkApproved?"approved":"pending"}/></div>
-        <div className="igrid">
-          <div className="ibox"><img src={s.mkFront||"https://placehold.co/300x380/0d0d0d/4caf50?text=3D+FRONT"} alt=""/><div className="ilbl">Front View</div></div>
-          <div className="ibox"><img src={s.mkBack||"https://placehold.co/300x380/0d0d0d/4caf50?text=3D+BACK"} alt=""/><div className="ilbl">Back View</div></div>
-        </div>
-        {s.mkDescription&&<div className="abox" style={{marginTop:10}}><div className="al">Mockup Notes</div>{s.mkDescription}</div>}
-        <div className="brow">
-          <button className="btn btn-g" onClick={()=>set("mkApproved",true)}>Approve Mockups</button>
-          <button className="btn btn-gh" onClick={()=>{setEditFor("mockup");set("mkApproved",false);}}>Request Edits</button>
-          {s.mkApproved&&<span style={{color:"#4caf50",fontSize:10}}>Approved</span>}
-        </div>
-      </div>
-      {(s.inspoClean||s.inspoPrev)&&<div className="card">
-        <div className="ch">Cleaned Inspiration & Callouts</div>
-        <div className="igrid">
-          <div className="ibox"><img src={s.inspoPrev} alt=""/><div className="ilbl">Original</div></div>
-          <div className="ibox"><img src={s.inspoClean||s.inspoPrev} alt=""/><div className="ilbl">Analysed</div></div>
-        </div>
-        {s.inspoAnalysis&&<div className="abox green" style={{marginTop:10}}><div className="al">Analysis</div>{s.inspoAnalysis}</div>}
-        {s.callouts&&s.callouts.length>0&&<>
-          <div style={{fontSize:8,letterSpacing:".15em",color:"#555",margin:"12px 0 7px",textTransform:"uppercase"}}>Detail Callouts</div>
-          <div className="cgrid">{s.callouts.map((c,i)=>(
-            <div key={i} className="cbox"><img src={c.url} alt={c.label}/><div className="clbl">{c.label}</div>
-            {c.description&&<div className="cdesc">{c.description.slice(0,100)}...</div>}</div>
-          ))}</div>
-        </>}
-      </div>}
-      {editFor&&<div className="card" style={{borderColor:"#ff980044"}}>
-        <div className="ch">Request Edits - {editFor==="sketch"?"Sketches":"Mockups"}</div>
-        <div className="field"><label className="lbl">Describe changes needed</label>
-          <textarea rows={3} placeholder="e.g. Make collar wider, add back zip..." value={editTxt} onChange={e=>setEditTxt(e.target.value)}/></div>
-        <button className="btn btn-o" onClick={()=>{set(editFor==="sketch"?"skEditReq":"mkEditReq",editTxt);setEditFor("");setEditTxt("");}}>Submit Edit Request</button>
-      </div>}
-      <div className="card">
-        <div className="ch">Final Factory Notes</div>
-        <textarea rows={7} value={s.notes} onChange={e=>set("notes",e.target.value)}/>
-      </div>
-      <div className="snav">
-        <button className="btn btn-gh" onClick={back}>Back</button>
-        <button className="btn btn-g" onClick={next} disabled={!approved}>Generate Tech Pack</button>
+    <div className={"sq-item"+(active?" active":"")+" "+item.status} onClick={onClick}>
+      <div className="sq-no">{item.sampleNo||"?"}</div>
+      <div className="sq-name">{item.styleName||"Unknown style"}</div>
+      <div className="sq-row">
+        <div className="sq-brand">{item.brand||""} {item.cat||""}</div>
+        <div className={"sq-st "+item.status}>{item.status}</div>
       </div>
     </div>
   );
 }
 
-function S7({s}){
-  const[factories,setFactories]=useState([
-    {id:1,name:"Main Factory - Guangzhou",email:"production@factory-gz.com",tags:["Production"]},
-    {id:2,name:"Sample Room",email:"samples@factory-gz.com",tags:["Samples"]},
-    {id:3,name:"QC Team",email:"qc@factory-gz.com",tags:["QC"]},
-  ]);
-  const[sel,setSel]=useState([]);
-  const[fsearch,setFsearch]=useState("");
-  const[newName,setNewName]=useState("");
-  const[newEmail,setNewEmail]=useState("");
-  const[msg,setMsg]=useState("Please find the tech pack for "+s.sampleNo+" - "+s.styleName+" ("+s.season+") attached. Please review and confirm receipt.");
-  const[sending,setSending]=useState(false);
-  const[sendSt,setSendSt]=useState("");
-  const[slacking,setSlacking]=useState(false);
-  const[slackSt,setSlackSt]=useState("");
-
-  const toggle=e=>setSel(p=>p.includes(e)?p.filter(x=>x!==e):[...p,e]);
-  const addContact=()=>{
-    if(!newName||!newEmail)return;
-    setFactories(p=>[...p,{id:Date.now(),name:newName,email:newEmail,tags:["Custom"]}]);
-    setNewName("");setNewEmail("");
-  };
-  const ffiltered=factories.filter(f=>!fsearch||f.name.toLowerCase().includes(fsearch.toLowerCase())||f.email.toLowerCase().includes(fsearch.toLowerCase()));
-  const isSp=sz=>isSampleSize(sz,s.sz);
-  const slackChannel=slackChannelName(s.sampleNo,s.styleName);
-
-  async function sendTP(){
-    setSending(true);setSendSt("");
-    const recipients=sel.length>0?sel:factories.map(f=>f.email);
-    try{
-      await Promise.all(recipients.map(to=>sendEmail(to,"Tech Pack: "+s.sampleNo+" - "+s.styleName,"<p style='font-family:monospace'>"+escHtml(msg)+"</p><br/><p style='font-family:monospace'>Sample: "+s.sampleNo+" | Style: "+s.styleName+" | Brand: "+s.brand+" | Season: "+s.season+" | Category: "+s.cat+" | Sample Size: "+s.sz+"</p>")));
-      setSendSt("sent");
-    }catch(e){
-      setSendSt("error: "+e.message);
-    }
-    setSending(false);
-  }
-
-  async function pushSlack(){
-    setSlacking(true);setSlackSt("");
-    try{
-      const channelId=await slackCreateChannel(slackChannel);
-      await slackPost(channelId,":shirt: *Tech Pack Ready: "+s.sampleNo+" - "+s.styleName+"*\nBrand: "+s.brand+" | Category: "+s.cat+" | Sample Size: "+s.sz+" | Season: "+s.season+"\n\n"+msg);
-      setSlackSt("Posted to #"+slackChannel);
-    }catch(e){
-      setSlackSt("Error: "+e.message);
-    }
-    setSlacking(false);
-  }
-
-  const connected={
-    supabase:CFG.SUPABASE_URL!=="",
-    gemini:CFG.GEMINI_KEY!=="",
-    sg:CFG.SENDGRID_KEY!=="",
-    slack:CFG.SLACK_TOKEN!=="",
-  };
-
-  return(
-    <div>
-      <div className="sh">Tech Pack</div>
-      <div className="ss">Step 07 - Preview, Send to Factory, Post to Slack</div>
-      <div className="card">
-        <div className="ch">Tech Pack Preview - 3 Pages</div>
-        <div className="tp">
-          <div className="tpp">
-            <div className="tphdr">
-              <div>
-                <div className="tpbrand">{s.brand&&s.brand.toUpperCase()}</div>
-                <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:13}}>{s.sampleNo} - {s.styleName&&s.styleName.toUpperCase()}</div>
-              </div>
-              <div style={{textAlign:"right"}}>
-                <div className="tpref">PAGE 1 OF 3 - DESIGN OVERVIEW</div>
-                <div className="tpref">{s.season} - {new Date().toLocaleDateString("en-GB")}</div>
-              </div>
-            </div>
-            <div className="tpmeta">
-              {[["Sample",s.sampleNo],["Style",s.styleName],["Brand",s.brand],["Category",s.cat],["Size",s.sz],["Season",s.season],["Colorway",s.colorway],["Date",new Date().toLocaleDateString("en-GB")]].map(([k,v])=>(
-                <div key={k} className="tpmc"><div className="tpmk">{k}</div><div className="tpmv">{v||"--"}</div></div>
-              ))}
-            </div>
-            <div className="tpsh">Images - Inspiration, Sketch, 3D Mockup</div>
-            <div className="tpimgs">
-              <div className="tpib">{(s.inspoClean||s.inspoPrev)?<img src={s.inspoClean||s.inspoPrev} alt=""/>:<div className="tpibph">Inspiration</div>}<div className="tpilbl">Inspiration</div></div>
-              <div className="tpib">{s.skFront?<img src={s.skFront} alt=""/>:<div className="tpibph">Sketch Front</div>}<div className="tpilbl">Sketch - Front</div></div>
-              <div className="tpib">{s.skBack?<img src={s.skBack} alt=""/>:<div className="tpibph">Sketch Back</div>}<div className="tpilbl">Sketch - Back</div></div>
-              <div className="tpib">{s.mkFront?<img src={s.mkFront} alt=""/>:<div className="tpibph">3D Front</div>}<div className="tpilbl">3D Mockup - Front</div></div>
-              <div className="tpib">{s.mkBack?<img src={s.mkBack} alt=""/>:<div className="tpibph">3D Back</div>}<div className="tpilbl">3D Mockup - Back</div></div>
-              {s.callouts&&s.callouts[0]&&<div className="tpib"><img src={s.callouts[0].url} alt=""/><div className="tpilbl">Detail - {s.callouts[0].label}</div></div>}
-            </div>
-            {s.callouts&&s.callouts.length>1&&<>
-              <div className="tpsh">Detail Callouts</div>
-              <div className="tpimgs">{s.callouts.slice(1).map((c,i)=>(
-                <div key={i} className="tpib"><img src={c.url} alt={c.label}/><div className="tpilbl">{c.label}</div></div>
-              ))}</div>
-            </>}
-            {(s.skDescription||s.mkDescription)&&<>
-              <div className="tpsh">AI Analysis Notes</div>
-              {s.skDescription&&<div style={{fontSize:8,lineHeight:1.9,color:"#444",marginBottom:8,whiteSpace:"pre-wrap"}}><strong>Sketch:</strong> {s.skDescription}</div>}
-              {s.mkDescription&&<div style={{fontSize:8,lineHeight:1.9,color:"#444",whiteSpace:"pre-wrap"}}><strong>Mockup:</strong> {s.mkDescription}</div>}
-            </>}
-            <div className="tpsh">Design & Construction Notes</div>
-            <div className="tpnotes">{s.notes||"No factory notes."}</div>
-          </div>
-          <div className="tpp">
-            <div className="tphdr">
-              <div><div className="tpbrand">{s.brand&&s.brand.toUpperCase()}</div><div style={{fontFamily:"serif",fontSize:11}}>{s.sampleNo} - PAGE 2 OF 3 - FABRICS & TRIMS</div></div>
-              <div className="tpref">{s.season}</div>
-            </div>
-            <div className="tpsh">Main Fabric</div>
-            <div className="tpfrow">
-              <div className="tpfimg">{s.fabPrev?<img src={s.fabPrev} alt="fabric"/>:<span>FABRIC CARD</span>}</div>
-              <div className="tpsup"><strong>Fabric Details</strong><br/>{s.fabDesc||s.fabSuggest||"--"}<br/><br/><strong>Supplier</strong><br/>{s.suppInfo||"--"}</div>
-            </div>
-            {s.trimPrev&&<>
-              <div className="tpsh">Trim Fabric</div>
-              <div className="tpfrow">
-                <div className="tpfimg"><img src={s.trimPrev} alt="trim"/></div>
-                <div className="tpsup"><strong>Trim Details</strong><br/>{s.trimDesc||"--"}</div>
-              </div>
-            </>}
-          </div>
-          <div className="tpp">
-            <div className="tphdr">
-              <div><div className="tpbrand">{s.brand&&s.brand.toUpperCase()}</div><div style={{fontFamily:"serif",fontSize:11}}>{s.sampleNo} - PAGE 3 OF 3 - SIZE CHART</div></div>
-              <div className="tpref">{s.season}</div>
-            </div>
-            <div className="tpsh">{s.chart?(s.chart.name+" ("+s.chart.code+")"):"Size Chart"} - Sample Size: <strong>{s.sz}</strong></div>
-            {s.chartData?(
-              <div style={{overflowX:"auto"}}>
-                <table className="tpsztbl">
-                  <thead><tr>
-                    <th style={{textAlign:"left"}}>Measurement</th>
-                    <th style={{textAlign:"left"}}>Description</th>
-                    {s.chartData.sizes.map(sz=><th key={sz} className={isSp(sz)?"sp":""}>{sz}</th>)}
-                  </tr></thead>
-                  <tbody>{s.chartData.rows.map((row,i)=>(
-                    <tr key={i}>
-                      <td className="ml">{row.measurement}</td>
-                      <td className="ml" style={{color:"#999",fontSize:7}}>{row.description||"--"}</td>
-                      {s.chartData.sizes.map(sz=><td key={sz} className={isSp(sz)?"sp":""}>{row.sizes[sz]||"--"}</td>)}
-                    </tr>
-                  ))}</tbody>
-                </table>
-                <div style={{fontSize:7,color:"#999",marginTop:5}}>Sample size {s.sz} highlighted - all measurements in cm</div>
-              </div>
-            ):(
-              <div style={{background:"#f9f9f9",padding:10,fontSize:9,color:"#999",border:"1px solid #ececec"}}>
-                {s.chartFile?"Chart: "+s.chartFile.name+" - Sample size "+s.sz:"Connect Supabase or upload chart file to display size table."}
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-      <div className="card">
-        <div className="ch">Send to Factory</div>
-        <div className="field"><label className="lbl">Email Message</label><textarea rows={3} value={msg} onChange={e=>setMsg(e.target.value)}/></div>
-        <div className="field"><label className="lbl">Search contacts</label><input type="text" placeholder="Name or email..." value={fsearch} onChange={e=>setFsearch(e.target.value)}/></div>
-        {ffiltered.map(f=>(
-          <div key={f.id} className="frow">
-            <input type="checkbox" checked={sel.includes(f.email)} onChange={()=>toggle(f.email)}/>
-            <div style={{flex:1}}><div className="fn">{f.name}</div><div className="fe">{f.email}</div></div>
-            {f.tags.map(t=><span key={t} className="ftag">{t}</span>)}
-          </div>
-        ))}
-        <div className="hdiv"/>
-        <div style={{fontSize:8,letterSpacing:".2em",color:G,textTransform:"uppercase",marginBottom:12}}>Add New Contact</div>
-        <div className="g2">
-          <div className="field"><label className="lbl">Name</label><input type="text" placeholder="Contact name" value={newName} onChange={e=>setNewName(e.target.value)}/></div>
-          <div className="field"><label className="lbl">Email</label><input type="email" placeholder="email@factory.com" value={newEmail} onChange={e=>setNewEmail(e.target.value)}/></div>
-        </div>
-        <button className="btn btn-gh" onClick={addContact} disabled={!newName||!newEmail}>+ Save Contact</button>
-        <div className="brow" style={{marginTop:16}}>
-          <button className="btn btn-g" onClick={sendTP} disabled={sending}>{sending?"Sending...":"Send Tech Pack to Factory"}</button>
-          {sending&&<Loader text="Sending..."/>}
-        </div>
-        {sendSt==="sent"&&<div className="sst ok">Tech pack sent to {sel.length>0?sel.join(", "):factories.map(f=>f.email).join(", ")}</div>}
-      </div>
-      <div className="card">
-        <div className="ch">Slack Integration</div>
-        <p style={{fontSize:10,color:"#444",lineHeight:1.8,marginBottom:12}}>
-          Creates Slack channel <strong style={{color:G}}>{"#"+slackChannel}</strong> and posts tech pack details.
-        </p>
-        <button className="btn btn-o" onClick={pushSlack} disabled={slacking}>{slacking?"Posting to Slack...":"Create Channel & Post to Slack"}</button>
-        {slacking&&<Loader text="Creating Slack channel..."/>}
-        {slackSt&&<div className="sst ok" style={{marginTop:10}}>{slackSt}</div>}
-      </div>
-      <div className="card">
-        <div className="ch">API Connection Status</div>
-        <div className="connstat">
-          <div>Supabase (Size Charts) <span className={connected.supabase?"ok":"no"}>{connected.supabase?"Connected":"Not configured"}</span></div>
-          <div>Gemini AI (Sketch & Analysis) <span className={connected.gemini?"ok":"warn"}>{connected.gemini?"Connected":"Not configured"}</span></div>
-          <div>SendGrid (Email) <span className={connected.sg?"ok":"warn"}>{connected.sg?"Connected":"Add SendGrid key when ready"}</span></div>
-          <div>Slack <span className={connected.slack?"ok":"warn"}>{connected.slack?"Connected":"Token added - testing needed"}</span></div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ---- MAIN APP ----
-const INIT={
-  desc:"",inspoFile:null,inspoPrev:null,fabFile:null,fabPrev:null,clarify:"",
-  brand:"",cat:"",sz:"",styleName:"",sampleNo:"",season:"SS27",colorway:"",answers:"",notes:"",
-  fabDesc:"",fabSuggest:"",suppInfo:"",fabApproved:false,trimPrev:null,trimDesc:"",
-  chart:null,chartFile:null,chartData:null,
-  skFront:null,skBack:null,mkFront:null,mkBack:null,inspoClean:null,callouts:[],
-  skDescription:"",mkDescription:"",inspoAnalysis:"",
-  skApproved:false,mkApproved:false,skEditReq:"",mkEditReq:"",
-};
-
+// --- APP ---
 function App(){
-  const[step,setStep]=useState(0);
-  const[st,setSt]=useState(INIT);
-  const set=(k,v)=>setSt(p=>Object.assign({},p,{[k]:v}));
-  const prog=(step/(STEPS.length-1))*100;
-  const sbInfo=[
-    {k:"Sample",v:st.sampleNo},{k:"Brand",v:st.brand},
-    {k:"Cat",v:st.cat},{k:"Size",v:st.sz},
-    {k:"Season",v:st.season},{k:"Style",v:st.styleName},
-  ];
-  const checks=[
-    {l:"Style Brief",done:!!st.desc},
-    {l:"Brand & Size",done:!!(st.brand&&st.sz)},
-    {l:"Fabric",done:!!(st.fabApproved||st.fabFile)},
-    {l:"Size Chart",done:!!(st.chart||st.chartFile)},
-    {l:"Sketch",done:!!(st.skFront&&st.mkFront)},
-    {l:"Approved",done:!!(st.skApproved&&st.mkApproved)},
-    {l:"Tech Pack",done:false},
-  ];
+  const [messages,setMessages]=useState([]);
+  const [samples,setSamples]=useState([]);
+  const [input,setInput]=useState("");
+  const [polling,setPolling]=useState(false);
+  const [sourceChannel,setSourceChannel]=useState("");
+  const [selectedId,setSelectedId]=useState(null);
+  const lastTsRef=useRef("0");
+  const sourceIdRef=useRef("");
+  const processingRef=useRef(false);
+  const endRef=useRef(null);
+  const msgIdCounter=useRef(0);
+
+  function newId(){return ++msgIdCounter.current;}
+
+  const addMsg=useCallback((msg)=>{
+    const id=newId();
+    setMessages(p=>[...p,{id,...msg,ts:Date.now()}]);
+    setTimeout(()=>endRef.current?.scrollIntoView({behavior:"smooth"}),60);
+    return id;
+  },[]);
+
+  const updateMsg=useCallback((id,patch)=>{
+    setMessages(p=>p.map(m=>m.id===id?{...m,...patch}:m));
+  },[]);
+
+  // Boot message
+  useEffect(()=>{
+    addMsg({role:"bot",text:"Hello! I'm the FROO.studio Tech Pack Bot.\n\nI watch a Slack channel for new sample submissions, build complete tech packs using AI, and post them back to Slack as a canvas in a dedicated channel named after the sample number.\n\nTo start: /monitor #channel-name\n\nOther commands:\n  /status — connection status\n  /help   — list commands\n\nOr just ask me anything about your samples."});
+    if(CFG.SOURCE_CHANNEL&&CFG.SLACK_TOKEN){
+      setTimeout(()=>startMonitoring(CFG.SOURCE_CHANNEL),600);
+    }
+  },[]);
+
+  async function startMonitoring(channelInput){
+    const channelName=channelInput.replace(/^#/,"").trim();
+    if(!channelName)return;
+    const id=addMsg({role:"bot",loading:true,text:"Connecting to #"+channelName+"..."});
+    try{
+      const chId=await slackFindChannel(channelName);
+      sourceIdRef.current=chId;
+      setSourceChannel(channelName);
+      // Snapshot current latest ts so we only react to new messages
+      const msgs=await slackGetHistory(chId,"0");
+      if(msgs.length)lastTsRef.current=msgs[msgs.length-1].ts;
+      setPolling(true);
+      updateMsg(id,{loading:false,text:`Connected to #${channelName} ✓\n\nI'm now monitoring for new sample submissions. I'll check every 30 seconds.\n\nExpected message format:\n  Sample No: B106\n  Style: Lily Dress\n  Brand: Froo | Girls | 4Y | SS27\n  Colorway: White/Blue\n  Description: ...\n  [attach inspiration image]\n\nI'll parse the message, build the tech pack, and create a canvas in a new #${channelName}-style channel.`});
+    }catch(e){
+      updateMsg(id,{loading:false,text:"Could not connect: "+e.message+"\n\nMake sure the bot token has channels:read and the bot is invited to the channel."});
+    }
+  }
+
+  // Polling effect
+  useEffect(()=>{
+    if(!polling)return;
+    async function tick(){
+      if(!sourceIdRef.current)return;
+      try{
+        const msgs=await slackGetHistory(sourceIdRef.current,lastTsRef.current);
+        for(const m of msgs){
+          if(parseFloat(m.ts)<=parseFloat(lastTsRef.current))continue;
+          lastTsRef.current=m.ts;
+          if((m.text||"").length>15&&!m.subtype){
+            queueSample(m);
+          }
+        }
+      }catch(e){console.warn("Poll error:",e.message);}
+    }
+    const timer=setInterval(tick,POLL_INTERVAL);
+    return()=>clearInterval(timer);
+  },[polling]);
+
+  async function queueSample(slackMsg){
+    if(processingRef.current){
+      addMsg({role:"system",text:"New message queued — will process after current sample."});
+    }
+    const notifId=addMsg({role:"bot",text:"New message in #"+sourceChannel+" — parsing sample data..."});
+    const parsed=await parseSampleMessage(slackMsg.text||"").catch(()=>null);
+    if(!parsed||!parsed.sampleNo){
+      updateMsg(notifId,{text:"Message in #"+sourceChannel+" doesn't look like a sample — skipping.\n\n\""+((slackMsg.text||"").slice(0,100))+"…\""});
+      return;
+    }
+    let inspoB64=null,inspoMime=null;
+    if(slackMsg.files&&slackMsg.files.length>0){
+      const f=slackMsg.files.find(f=>f.mimetype&&f.mimetype.startsWith("image/"));
+      if(f){
+        try{
+          const result=await slackDownloadAsB64(f.url_private);
+          inspoB64=result.b64;
+          inspoMime=f.mimetype||result.mime;
+        }catch(e){console.warn("Image download failed:",e.message);}
+      }
+    }
+    const sample={
+      id:Date.now(),
+      sampleNo:parsed.sampleNo,
+      styleName:parsed.styleName||"",
+      brand:parsed.brand||"",
+      cat:parsed.cat||"",
+      sz:parsed.sz||"",
+      season:parsed.season||"",
+      colorway:parsed.colorway||"",
+      desc:parsed.desc||"",
+      inspoB64,inspoMime,
+      status:"pending",
+    };
+    setSamples(p=>[...p,sample]);
+    setSelectedId(sample.id);
+    updateMsg(notifId,{text:`Sample detected: ${parsed.sampleNo} — ${parsed.styleName}\nBrand: ${parsed.brand||"?"} | ${parsed.cat||"?"} | Size ${parsed.sz||"?"} | ${parsed.season||"?"}\n${inspoB64?"Inspiration image downloaded ✓":"No image attached"}\n\nProcessing now...`});
+    await runPipeline(sample);
+  }
+
+  async function runPipeline(sample){
+    if(processingRef.current){
+      addMsg({role:"system",text:"Queued: "+sample.sampleNo+" will process after current job."});
+      // Simple sequential wait
+      while(processingRef.current)await new Promise(r=>setTimeout(r,2000));
+    }
+    processingRef.current=true;
+    setSamples(p=>p.map(s=>s.id===sample.id?{...s,status:"processing"}:s));
+
+    const stepsState={sketch:"pending",descriptions:"pending",image:"pending",chart:"pending",notes:"pending",channel:"pending",canvas:"pending"};
+    const pid=addMsg({role:"bot",text:`Building tech pack for ${sample.sampleNo} — ${sample.styleName}`,steps:{...stepsState},activeStep:"sketch"});
+
+    function logStep(key){
+      // Mark previous active as done, set new active
+      Object.keys(stepsState).forEach(k=>{if(stepsState[k]==="active")stepsState[k]="done";});
+      stepsState[key]="active";
+      updateMsg(pid,{steps:{...stepsState},activeStep:key});
+    }
+    function doneStep(key){stepsState[key]="done";}
+
+    try{
+      logStep("sketch");
+      const tp=await buildTechPack(sample,(key)=>{
+        doneStep(Object.keys(stepsState).find(k=>stepsState[k]==="active")||"sketch");
+        logStep(key);
+      });
+
+      logStep("channel");
+      const chName=slackChannelName(sample.sampleNo,sample.styleName);
+      const channelId=await slackCreateOrFindChannel(chName);
+
+      logStep("canvas");
+      const markdown=buildCanvasMarkdown(sample,tp);
+      let canvasId=null;
+      try{
+        canvasId=await slackCreateCanvas(channelId,"Tech Pack: "+sample.sampleNo+" — "+sample.styleName,markdown);
+      }catch(e){
+        console.warn("Canvas not available:",e.message);
+      }
+
+      // Always post a summary message
+      await slackPostMessage(channelId,
+        `:shirt: *Tech Pack: ${sample.sampleNo} — ${sample.styleName}*\n`+
+        `*Brand:* ${sample.brand||"--"} | *Category:* ${sample.cat||"--"} | *Size:* ${sample.sz||"--"} | *Season:* ${sample.season||"--"}\n`+
+        (canvasId?`\nCanvas created above ↑`:`\nSee full tech pack below ↓`)
+      );
+
+      if(!canvasId){
+        // Fallback: post tech pack content directly
+        const chunks=markdown.match(/[\s\S]{1,3000}/g)||[];
+        for(const chunk of chunks.slice(0,4)){
+          await slackPostMessage(channelId,chunk);
+        }
+      }
+
+      Object.keys(stepsState).forEach(k=>stepsState[k]="done");
+      updateMsg(pid,{
+        text:`Tech pack complete! ✓\n\n${sample.sampleNo} — ${sample.styleName}\n${canvasId?"Canvas created":"Posted"} in #${chName}`,
+        steps:{...stepsState},activeStep:null,loading:false,
+      });
+      setSamples(p=>p.map(s=>s.id===sample.id?{...s,status:"done"}:s));
+    }catch(e){
+      Object.keys(stepsState).forEach(k=>{if(stepsState[k]==="active")stepsState[k]="error";});
+      updateMsg(pid,{
+        text:`Error processing ${sample.sampleNo}: ${e.message}`,
+        steps:{...stepsState},activeStep:null,loading:false,
+      });
+      setSamples(p=>p.map(s=>s.id===sample.id?{...s,status:"error"}:s));
+    }
+    processingRef.current=false;
+  }
+
+  async function submit(){
+    const txt=input.trim();
+    if(!txt)return;
+    setInput("");
+
+    if(txt.startsWith("/monitor")){
+      const ch=txt.slice(8).trim();
+      if(ch)await startMonitoring(ch);
+      else addMsg({role:"bot",text:"Usage: /monitor #channel-name"});
+      return;
+    }
+    if(txt==="/status"){
+      addMsg({role:"user",text:txt});
+      addMsg({role:"bot",text:`Status:\n• Slack token: ${CFG.SLACK_TOKEN?"Configured":"Not configured"}\n• Gemini: ${CFG.GEMINI_KEY?"Configured":"Not configured"}\n• Claude: Configured\n• Monitoring: ${polling?"#"+sourceChannel+" (active)":"Not started"}\n• Samples processed: ${samples.filter(s=>s.status==="done").length} / ${samples.length}\n• Processing now: ${processingRef.current?"Yes":"No"}`});
+      return;
+    }
+    if(txt==="/help"){
+      addMsg({role:"user",text:txt});
+      addMsg({role:"bot",text:`Commands:\n  /monitor #channel  — Start watching a Slack channel\n  /status            — Show connection & queue status\n  /help              — Show this help\n\nOr type any question and I'll answer it.`});
+      return;
+    }
+
+    addMsg({role:"user",text:txt});
+    const rid=addMsg({role:"bot",loading:true,text:""});
+    const r=await callClaude(
+      [{role:"user",content:txt}],
+      "You are the FROO.studio Tech Pack Bot assistant. Help with fashion tech pack questions, garment construction, sample management, and the FROO.studio workflow. Be concise and helpful."
+    ).catch(()=>"Sorry, I couldn't reach Claude right now.");
+    updateMsg(rid,{loading:false,text:r});
+  }
+
+  const connected={slack:CFG.SLACK_TOKEN!=="",gemini:CFG.GEMINI_KEY!==""};
+
   return(
     <>
       <style>{CSS}</style>
       <div className="app">
         <div className="topbar">
-          <div className="logo">FROO<em>.</em>studio</div>
-          <div className="sbar">
-            {STEPS.map((s,i)=>(
-              <div key={i} className={"si"+(i===step?" active":i<step?" done":"")}>
-                {i<step?"✓":("0"+(i+1))} {s}
-              </div>
-            ))}
+          <div className="logo">FROO<em>.</em>studio <span className="logo-sub">Tech Pack Bot</span></div>
+          <div className="status-bar">
+            <div className={"status-dot"+(polling?" active":"")}/>
+            <div className={"status-txt"+(polling?" active":"")}>
+              {polling?"Monitoring #"+sourceChannel:"Not monitoring"}
+            </div>
+            <div className={"api-chip "+(connected.slack?"ok":"no")}>Slack</div>
+            <div className={"api-chip "+(connected.gemini?"ok":"no")}>Gemini</div>
           </div>
-          <button className="newbtn" onClick={()=>{setSt(INIT);setStep(0);}}>+ New Sample</button>
         </div>
-        <div className="layout">
+        <div className="body">
           <div className="sidebar">
-            <div>
-              <div className="sblbl">Sample Info</div>
-              {sbInfo.map(r=>(
-                <div key={r.k} className="sbrow">
-                  <span className="sbk">{r.k}</span>
-                  <span className="sbv">{r.v||"--"}</span>
-                </div>
+            <div className="sb-hdr">
+              <span>Sample Queue</span>
+              <span className="sb-count">{samples.length}</span>
+            </div>
+            <div className="queue">
+              {samples.length===0&&(
+                <div className="sq-empty">No samples yet.<br/>Monitoring #{sourceChannel||"..."}<br/>for new submissions.</div>
+              )}
+              {[...samples].reverse().map(s=>(
+                <SampleItem key={s.id} item={s} active={selectedId===s.id} onClick={()=>setSelectedId(s.id)}/>
               ))}
             </div>
-            <div className="hdiv"/>
-            <div>
-              <div className="sblbl">Checklist</div>
-              {checks.map((c,i)=>(
-                <div key={i} className={"cli"+(c.done?" done":" pending")}>{c.done?"✓":"○"} {c.l}</div>
-              ))}
-            </div>
-            {st.inspoPrev&&<div><div className="sblbl">Inspo</div><img src={st.inspoPrev} className="sbimg" alt="inspo"/></div>}
-            {st.fabPrev&&<div><div className="sblbl">Fabric</div><img src={st.fabPrev} className="sbimg" alt="fabric"/></div>}
           </div>
-          <div className="main">
-            <div className="prog"><div className="progf" style={{width:prog+"%"}}/></div>
-            {step===0&&<S1 s={st} set={set} next={()=>setStep(1)}/>}
-            {step===1&&<S2 s={st} set={set} back={()=>setStep(0)} next={()=>setStep(2)}/>}
-            {step===2&&<S3 s={st} set={set} back={()=>setStep(1)} next={()=>setStep(3)}/>}
-            {step===3&&<S4 s={st} set={set} back={()=>setStep(2)} next={()=>setStep(4)}/>}
-            {step===4&&<S5 s={st} set={set} back={()=>setStep(3)} next={()=>setStep(5)}/>}
-            {step===5&&<S6 s={st} set={set} back={()=>setStep(4)} next={()=>setStep(6)}/>}
-            {step===6&&<S7 s={st}/>}
+          <div className="chat">
+            <div className="msgs">
+              {messages.map(m=><MsgBubble key={m.id} msg={m}/>)}
+              <div ref={endRef}/>
+            </div>
+            <div className="input-bar">
+              <input
+                className="chat-input"
+                value={input}
+                onChange={e=>setInput(e.target.value)}
+                onKeyDown={e=>e.key==="Enter"&&input.trim()&&submit()}
+                placeholder={polling?`Monitoring #${sourceChannel} — type /help for commands`:"/monitor #channel-name to start"}
+              />
+              <button className="send-btn" onClick={submit} disabled={!input.trim()}>Send</button>
+            </div>
           </div>
         </div>
       </div>
