@@ -1,48 +1,88 @@
 const axios = require("axios");
 const fs = require("fs");
-const FormData = require("form-data");
 const config = require("../config");
 const log = require("../utils/logger");
 const storage = require("../utils/storage");
 
-const api = axios.create({
-  baseURL: config.nanoBanana.apiUrl,
-  headers: { Authorization: `Bearer ${config.nanoBanana.apiKey}` },
-  timeout: 120_000, // image generation can take time
-});
+/**
+ * Nano Banana runs on Gemini's image generation API.
+ * All sketch, mockup, background removal, and callout generation
+ * is powered by Gemini multimodal with the same API key.
+ */
+
+const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const MODEL = "gemini-2.0-flash-exp";
+
+/**
+ * Call Gemini with a text prompt and optional reference image.
+ * Returns the generated image as a Buffer, or the text description
+ * if image generation isn't available (falls back gracefully).
+ */
+async function callGemini(prompt, imagePath) {
+  const parts = [{ text: prompt }];
+
+  if (imagePath && fs.existsSync(imagePath)) {
+    const imageBuffer = fs.readFileSync(imagePath);
+    const base64 = imageBuffer.toString("base64");
+    const ext = imagePath.split(".").pop().toLowerCase();
+    const mime = ext === "png" ? "image/png" : "image/jpeg";
+    parts.push({
+      inline_data: { mime_type: mime, data: base64 },
+    });
+  }
+
+  const res = await axios.post(
+    `${GEMINI_BASE}/models/${MODEL}:generateContent?key=${config.gemini.key}`,
+    {
+      contents: [{ parts }],
+      generationConfig: {
+        responseModalities: ["TEXT", "IMAGE"],
+      },
+    },
+    { timeout: 120_000 }
+  );
+
+  const candidate = res.data.candidates?.[0]?.content?.parts || [];
+
+  // Look for an image part first
+  const imagePart = candidate.find((p) => p.inline_data);
+  if (imagePart) {
+    return {
+      type: "image",
+      buffer: Buffer.from(imagePart.inline_data.data, "base64"),
+      mimeType: imagePart.inline_data.mime_type,
+    };
+  }
+
+  // Fall back to text
+  const textPart = candidate.find((p) => p.text);
+  return {
+    type: "text",
+    text: textPart?.text || "",
+  };
+}
 
 /**
  * Generate a technical sketch (front or back view).
- * @param {object} opts
- * @param {string} opts.description - garment description / factory notes
- * @param {string} opts.view - "front" or "back"
- * @param {string} [opts.inspirationImagePath] - local path to inspiration image
- * @param {string} opts.sampleId - for file storage
- * @returns {Promise<string>} local path to generated sketch
  */
 async function generateSketch({ description, view, inspirationImagePath, sampleId }) {
-  log.info("Generating sketch via Nano Banana", { view });
+  log.info("Generating sketch via Gemini (Nano Banana)", { view });
 
-  const form = new FormData();
-  form.append("prompt", `Technical flat sketch, ${view} view: ${description}`);
-  form.append("type", "technical_sketch");
-  form.append("view", view);
+  const prompt = `Generate a black and white technical flat sketch for apparel production, ${view} view. Clean line drawing on white background, no shading, no color. Garment: ${description}`;
 
-  if (inspirationImagePath && fs.existsSync(inspirationImagePath)) {
-    form.append("reference_image", fs.createReadStream(inspirationImagePath));
+  const result = await callGemini(prompt, inspirationImagePath);
+
+  if (result.type === "image") {
+    const ext = result.mimeType === "image/png" ? ".png" : ".jpg";
+    const filePath = storage.saveFile(result.buffer, `sketch_${view}${ext}`, sampleId);
+    log.info("Sketch generated", { view, filePath });
+    return filePath;
   }
 
-  const res = await api.post("/generate/sketch", form, {
-    headers: form.getHeaders(),
-    responseType: "arraybuffer",
-  });
-
-  const filePath = storage.saveFile(
-    Buffer.from(res.data),
-    `sketch_${view}.png`,
-    sampleId
-  );
-  log.info("Sketch generated", { view, filePath });
+  // If only text returned, save a placeholder note
+  log.warn("Sketch returned text instead of image", { view, text: result.text?.substring(0, 100) });
+  const placeholder = Buffer.from(`Sketch ${view}: ${result.text}`);
+  const filePath = storage.saveFile(placeholder, `sketch_${view}.txt`, sampleId);
   return filePath;
 }
 
@@ -50,28 +90,22 @@ async function generateSketch({ description, view, inspirationImagePath, sampleI
  * Generate a 3D mockup (front or back view).
  */
 async function generateMockup({ description, view, inspirationImagePath, sampleId }) {
-  log.info("Generating 3D mockup via Nano Banana", { view });
+  log.info("Generating 3D mockup via Gemini (Nano Banana)", { view });
 
-  const form = new FormData();
-  form.append("prompt", `3D garment mockup, ${view} view: ${description}`);
-  form.append("type", "3d_mockup");
-  form.append("view", view);
+  const prompt = `Generate a realistic 3D garment mockup, ${view} view. Photorealistic fabric rendering on a mannequin or flat lay. Garment: ${description}`;
 
-  if (inspirationImagePath && fs.existsSync(inspirationImagePath)) {
-    form.append("reference_image", fs.createReadStream(inspirationImagePath));
+  const result = await callGemini(prompt, inspirationImagePath);
+
+  if (result.type === "image") {
+    const ext = result.mimeType === "image/png" ? ".png" : ".jpg";
+    const filePath = storage.saveFile(result.buffer, `mockup_${view}${ext}`, sampleId);
+    log.info("Mockup generated", { view, filePath });
+    return filePath;
   }
 
-  const res = await api.post("/generate/mockup", form, {
-    headers: form.getHeaders(),
-    responseType: "arraybuffer",
-  });
-
-  const filePath = storage.saveFile(
-    Buffer.from(res.data),
-    `mockup_${view}.png`,
-    sampleId
-  );
-  log.info("Mockup generated", { view, filePath });
+  log.warn("Mockup returned text instead of image", { view });
+  const placeholder = Buffer.from(`Mockup ${view}: ${result.text}`);
+  const filePath = storage.saveFile(placeholder, `mockup_${view}.txt`, sampleId);
   return filePath;
 }
 
@@ -79,61 +113,47 @@ async function generateMockup({ description, view, inspirationImagePath, sampleI
  * Remove background from the inspiration image.
  */
 async function removeBackground({ imagePath, sampleId }) {
-  log.info("Removing background via Nano Banana");
+  log.info("Removing background via Gemini (Nano Banana)");
 
-  const form = new FormData();
-  form.append("image", fs.createReadStream(imagePath));
+  const prompt = "Remove the background from this image completely. Return the garment on a transparent or pure white background with no shadows.";
 
-  const res = await api.post("/tools/remove-background", form, {
-    headers: form.getHeaders(),
-    responseType: "arraybuffer",
-  });
+  const result = await callGemini(prompt, imagePath);
 
-  const filePath = storage.saveFile(
-    Buffer.from(res.data),
-    "inspiration_cleaned.png",
-    sampleId
-  );
-  log.info("Background removed", { filePath });
-  return filePath;
+  if (result.type === "image") {
+    const ext = result.mimeType === "image/png" ? ".png" : ".jpg";
+    const filePath = storage.saveFile(result.buffer, `inspiration_cleaned${ext}`, sampleId);
+    log.info("Background removed", { filePath });
+    return filePath;
+  }
+
+  log.warn("Background removal returned text instead of image");
+  return null;
 }
 
 /**
  * Generate zoomed-in detail callouts for key features.
- * @param {object} opts
- * @param {string} opts.description
- * @param {string[]} opts.features - list of features to highlight
- * @param {string} [opts.inspirationImagePath]
- * @param {string} opts.sampleId
- * @returns {Promise<Array<{label: string, imagePath: string}>>}
  */
 async function generateDetailCallouts({ description, features, inspirationImagePath, sampleId }) {
   log.info("Generating detail callouts", { features });
 
   const callouts = [];
   for (const feature of features) {
-    const form = new FormData();
-    form.append("prompt", `Zoomed detail callout of ${feature}: ${description}`);
-    form.append("type", "detail_callout");
-    form.append("feature", feature);
-
-    if (inspirationImagePath && fs.existsSync(inspirationImagePath)) {
-      form.append("reference_image", fs.createReadStream(inspirationImagePath));
-    }
+    const prompt = `Generate a zoomed-in detail view highlighting the ${feature} on this garment. Show construction detail clearly for factory reference. Garment: ${description}`;
 
     try {
-      const res = await api.post("/generate/callout", form, {
-        headers: form.getHeaders(),
-        responseType: "arraybuffer",
-      });
+      const result = await callGemini(prompt, inspirationImagePath);
 
-      const filePath = storage.saveFile(
-        Buffer.from(res.data),
-        `callout_${feature.replace(/\s+/g, "_")}.png`,
-        sampleId
-      );
-
-      callouts.push({ label: feature, imagePath: filePath });
+      if (result.type === "image") {
+        const ext = result.mimeType === "image/png" ? ".png" : ".jpg";
+        const filePath = storage.saveFile(
+          result.buffer,
+          `callout_${feature.replace(/\s+/g, "_")}${ext}`,
+          sampleId
+        );
+        callouts.push({ label: feature, imagePath: filePath, description: "" });
+      } else {
+        callouts.push({ label: feature, imagePath: null, description: result.text || "" });
+      }
     } catch (err) {
       log.warn("Failed to generate callout", { feature, error: err.message });
       callouts.push({ label: feature, imagePath: null, error: err.message });

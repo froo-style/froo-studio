@@ -10,12 +10,8 @@ module.exports = {
     url: process.env.SUPABASE_URL,
     key: process.env.SUPABASE_KEY,
   },
-  nanoBanana: {
-    apiUrl: process.env.NANO_BANANA_API_URL || "https://api.nanobanana.com/v1",
-    apiKey: process.env.NANO_BANANA_API_KEY,
-  },
   gemini: {
-    key: process.env.GEMINI_KEY,
+    key: process.env.GEMINI_KEY || process.env.NANO_BANANA_API_KEY,
   },
   anthropic: {
     key: process.env.ANTHROPIC_API_KEY,
