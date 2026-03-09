@@ -30,10 +30,30 @@ async function main() {
   // ───────────────────────────────────────────
   app.message(async ({ message, say }) => {
     try {
+      log.info("Message event received", {
+        channel: message.channel,
+        user: message.user,
+        subtype: message.subtype,
+        hasText: !!message.text,
+        hasFiles: !!(message.files && message.files.length),
+        fileCount: (message.files || []).length,
+        threadTs: message.thread_ts,
+        ts: message.ts,
+        bot_id: message.bot_id,
+      });
+
+      // Skip bot messages
+      if (message.subtype === "bot_message" || message.bot_id) {
+        log.debug("Skipping bot message");
+        return;
+      }
+
       // Only process messages in the new-samples channel
       const channelInfo = await app.client.conversations.info({
         channel: message.channel,
       });
+
+      log.info("Channel info", { channelName: channelInfo.channel.name, expected: config.app.newSamplesChannel });
 
       if (channelInfo.channel.name !== config.app.newSamplesChannel) {
         // Check if this is a thread reply in an active workflow
@@ -50,10 +70,14 @@ async function main() {
       }
 
       // This is a new top-level message in #new-samples
+      log.info("Processing as new sample submission");
       const parsed = parseSampleMessage(message);
+      log.info("Parse result", { parsed: !!parsed, sampleNumber: parsed?.sampleNumber, imageCount: parsed?.imageFiles?.length });
       if (parsed) {
         message.channel = message.channel; // ensure channel is set
         await handleNewSample(message);
+      } else {
+        log.warn("Message did not qualify as sample submission", { text: message.text?.substring(0, 100) });
       }
     } catch (err) {
       log.error("Error handling message", { error: err.message, stack: err.stack });
