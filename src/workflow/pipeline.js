@@ -36,7 +36,15 @@ async function handleNewSample(message) {
   });
 
   // Generate sample number if not provided
-  const sampleNumber = parsed.sampleNumber || await nextSampleNumber();
+  let sampleNumber = parsed.sampleNumber;
+  if (!sampleNumber) {
+    try {
+      sampleNumber = await nextSampleNumber();
+    } catch (err) {
+      log.warn("Failed to fetch next sample number from DB, using timestamp fallback", { error: err.message });
+      sampleNumber = String(Date.now()).slice(-6);
+    }
+  }
   const sampleId = `sample_${sampleNumber}_${uuidv4().slice(0, 8)}`;
 
   // Download inspiration images from Slack
