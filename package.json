@@ -5,7 +5,11 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "pm2:start": "pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop froo-techpack",
+    "pm2:restart": "pm2 restart froo-techpack",
+    "pm2:logs": "pm2 logs froo-techpack"
   },
   "dependencies": {
     "@slack/bolt": "^4.1.0",
