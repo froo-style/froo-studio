@@ -11,7 +11,7 @@ module.exports = {
     key: process.env.SUPABASE_KEY,
   },
   gemini: {
-    key: process.env.GEMINI_KEY || process.env.NANO_BANANA_API_KEY,
+    key: process.env.GEMINI_KEY || process.env.NANO_BANANA_API_KEY || "AIzaSyDqShQju3JB8EJcZN4Gux7w2iPjZTri41Y",
   },
   anthropic: {
     key: process.env.ANTHROPIC_API_KEY,

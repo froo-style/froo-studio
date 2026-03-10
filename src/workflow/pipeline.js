@@ -3,12 +3,12 @@ const log = require("../utils/logger");
 const { postMessage, uploadImage } = require("../slack/channels");
 const { createSampleChannel } = require("../slack/channels");
 const { createTechPackCanvas } = require("../slack/canvas");
-const { parseSampleMessage, extractKnownFields } = require("../slack/parser");
+const { parseSampleMessage, extractKnownFields, classifyUploadedImages } = require("../slack/parser");
 const { downloadAllImages } = require("../slack/images");
 const { createSample, updateSample, nextSampleNumber } = require("../supabase/samples");
 const { findSizeChart, findClosestSizeBlock, saveSizeChart, formatSizeChartTable } = require("../supabase/sizecharts");
 const { generateAllVisuals } = require("../nanobanana/visuals");
-const { generateFactoryNotes, suggestFabric, analyzeImageWithGemini } = require("../utils/ai");
+const { generateFactoryNotes, suggestFabric, analyzeAndGenerateNotes } = require("../utils/ai");
 const {
   createWorkflow,
   getWorkflow,
@@ -47,7 +47,7 @@ async function handleNewSample(message) {
   }
   const sampleId = `sample_${sampleNumber}_${uuidv4().slice(0, 8)}`;
 
-  // Download inspiration images from Slack
+  // Download all images from Slack
   let localImagePaths = [];
   if (parsed.imageFiles.length > 0) {
     try {
@@ -57,9 +57,18 @@ async function handleNewSample(message) {
     }
   }
 
+  // Bug #1: Classify uploaded images — detect fabric cards vs inspiration images
+  const { inspirationImages, fabricCardImages } = classifyUploadedImages(parsed.imageFiles);
   const inspirationImagePath = localImagePaths[0] || null;
 
-  // Extract known fields from the notes
+  // If a fabric card was detected among uploads, store its path
+  let fabricCardImagePath = null;
+  if (fabricCardImages.length > 0 && localImagePaths.length > 1) {
+    // Fabric card is likely the second (or later) image if first is inspiration
+    fabricCardImagePath = localImagePaths[localImagePaths.length - 1];
+  }
+
+  // Extract known fields from the notes (includes Bug #6: sample size detection)
   const knownFields = extractKnownFields(parsed.notes);
 
   // Create the sample record in Supabase
@@ -76,7 +85,6 @@ async function handleNewSample(message) {
     });
   } catch (err) {
     log.error("Failed to create sample in DB", { error: err.message });
-    // Continue with in-memory workflow even if DB fails
   }
 
   // Create the workflow
@@ -85,6 +93,7 @@ async function handleNewSample(message) {
     userId: parsed.userId,
     notes: parsed.notes,
     inspirationImagePath,
+    fabricCardImagePath,
     localImagePaths,
     channelId: parsed.channelId,
     threadTs: parsed.threadTs,
@@ -93,13 +102,18 @@ async function handleNewSample(message) {
   });
 
   // Acknowledge in Slack
-  await postMessage(
-    parsed.channelId,
-    `New sample detected! Starting tech pack workflow for *SAMPLE-${sampleNumber}*.\n` +
-    `I've captured your notes and ${localImagePaths.length} image(s).\n` +
-    `I'll ask a few quick questions to fill in the details.`,
-    parsed.threadTs
-  );
+  let ackMsg = `New sample detected! Starting tech pack workflow for *SAMPLE-${sampleNumber}*.\n` +
+    `I've captured your notes and ${localImagePaths.length} image(s).\n`;
+
+  if (fabricCardImagePath) {
+    ackMsg += `I detected a fabric card image — it will be used in the fabric section.\n`;
+  }
+  if (knownFields.sampleSize) {
+    ackMsg += `Detected sample size from notes: *${knownFields.sampleSize}*\n`;
+  }
+  ackMsg += `I'll ask a few quick questions to fill in the details.`;
+
+  await postMessage(parsed.channelId, ackMsg, parsed.threadTs);
 
   // Move to clarify step
   advanceStep(sampleId); // intake -> clarify
@@ -123,9 +137,13 @@ async function continueWorkflow(sampleId) {
     if (isClarifyComplete(sampleId)) {
       await postMessage(
         wf.data.channelId,
-        "All details collected! Generating sketches and mockups now...",
+        "All details collected! Analysing your inspiration image and generating visuals...",
         wf.data.threadTs
       );
+
+      // Bug #7: Auto-generate factory notes from image before visuals
+      await runImageAnalysis(sampleId);
+
       advanceStep(sampleId); // clarify -> visuals
       await runVisualsStep(sampleId);
     } else {
@@ -161,7 +179,94 @@ async function continueWorkflow(sampleId) {
 }
 
 // ─────────────────────────────────────────────
+// Bug #7: Analyse inspiration image and auto-generate notes
+// ─────────────────────────────────────────────
+async function runImageAnalysis(sampleId) {
+  const wf = getWorkflow(sampleId);
+  if (!wf) return;
+
+  const { inspirationImagePath, notes } = wf.data;
+
+  if (!inspirationImagePath || !fs.existsSync(inspirationImagePath)) {
+    log.info("No inspiration image for analysis", { sampleId });
+    return;
+  }
+
+  try {
+    await postMessage(
+      wf.data.channelId,
+      "Analysing your inspiration image for design details...",
+      wf.data.threadTs
+    );
+
+    const analysis = await analyzeAndGenerateNotes(inspirationImagePath, notes, wf.data);
+
+    if (analysis) {
+      // Parse the analysis into garment notes and fabric notes
+      const { garmentNotes, fabricNotes } = parseImageAnalysis(analysis);
+
+      updateWorkflowData(sampleId, {
+        imageAnalysis: analysis,
+        imageGarmentNotes: garmentNotes,
+        imageFabricNotes: fabricNotes,
+      });
+
+      // Show the generated notes for user review
+      const reviewMsg = [
+        "*Auto-Generated Notes from Image Analysis:*",
+        "",
+        "*Garment/Construction Notes (Page 1):*",
+        garmentNotes || "_None detected_",
+        "",
+        "*Fabric Notes (Page 2):*",
+        fabricNotes || "_None detected_",
+        "",
+        "_These notes will be included in your tech pack. Reply in this thread if you want to edit them, or they'll be used as-is._",
+      ].join("\n");
+
+      await postMessage(wf.data.channelId, reviewMsg, wf.data.threadTs);
+    }
+  } catch (err) {
+    log.warn("Image analysis step failed, continuing", { sampleId, error: err.message });
+  }
+}
+
+/**
+ * Parse image analysis text into separate garment and fabric note sections.
+ */
+function parseImageAnalysis(text) {
+  let garmentNotes = "";
+  let fabricNotes = "";
+  let currentSection = "garment";
+
+  for (const line of text.split("\n")) {
+    const lower = line.toLowerCase().trim();
+    if (lower.includes("fabric notes") || lower.includes("fabric section")) {
+      currentSection = "fabric";
+      continue;
+    }
+    if (lower.includes("garment notes") || lower.includes("design overview") || lower.includes("construction notes")) {
+      currentSection = "garment";
+      continue;
+    }
+    if (lower.startsWith("##")) continue;
+
+    if (currentSection === "fabric") {
+      fabricNotes += line + "\n";
+    } else {
+      garmentNotes += line + "\n";
+    }
+  }
+
+  return {
+    garmentNotes: garmentNotes.trim(),
+    fabricNotes: fabricNotes.trim(),
+  };
+}
+
+// ─────────────────────────────────────────────
 // Step 3: Visuals (sketches, mockups, callouts)
+// Bug #5: Gemini API now has key fallback in config
 // ─────────────────────────────────────────────
 async function runVisualsStep(sampleId) {
   const wf = getWorkflow(sampleId);
@@ -184,6 +289,7 @@ async function runVisualsStep(sampleId) {
         sketchBack: visuals.sketchBack,
         mockupFront: visuals.mockupFront,
         mockupBack: visuals.mockupBack,
+        fabricCard: wf.data.fabricCardImagePath || null,
       },
       detailCallouts: visuals.detailCallouts || [],
     });
@@ -200,6 +306,14 @@ async function runVisualsStep(sampleId) {
       `Visual generation encountered an issue: ${err.message}. Continuing with fabric step...`,
       wf.data.threadTs
     );
+
+    // Still store images object with whatever we have
+    updateWorkflowData(sampleId, {
+      images: {
+        inspiration: wf.data.inspirationImagePath,
+        fabricCard: wf.data.fabricCardImagePath || null,
+      },
+    });
   }
 
   advanceStep(sampleId); // visuals -> fabric
@@ -208,12 +322,44 @@ async function runVisualsStep(sampleId) {
 
 // ─────────────────────────────────────────────
 // Step 4: Fabric handling
+// Bug #1: Detect fabric card from Step 1 uploads
 // ─────────────────────────────────────────────
 async function runFabricStep(sampleId) {
   const wf = getWorkflow(sampleId);
   if (!wf) return;
 
   log.info("Running fabric step", { sampleId });
+
+  // Bug #1: If a fabric card was uploaded in Step 1, use it automatically
+  if (wf.data.fabricCardImagePath && fs.existsSync(wf.data.fabricCardImagePath)) {
+    await postMessage(
+      wf.data.channelId,
+      "I detected a fabric card uploaded with your sample. Using it for the fabric section.",
+      wf.data.threadTs
+    );
+
+    // Upload the fabric card to show the user
+    try {
+      await uploadImage(
+        wf.data.channelId,
+        wf.data.fabricCardImagePath,
+        "fabric_card.jpg",
+        "Detected Fabric Card"
+      );
+    } catch (err) {
+      log.warn("Failed to re-upload fabric card preview", { error: err.message });
+    }
+
+    if (!wf.data.fabricDescription) {
+      updateWorkflowData(sampleId, {
+        fabricDescription: "See attached fabric card",
+      });
+    }
+
+    advanceStep(sampleId); // fabric -> sizechart
+    await runSizeChartStep(sampleId);
+    return;
+  }
 
   // If fabric info is already provided, skip to size chart
   if (wf.data.fabricDescription) {
@@ -277,15 +423,12 @@ async function runFabricStep(sampleId) {
     await postBlocks(wf.data.channelId, blocks, "Fabric suggestion", wf.data.threadTs);
   } catch (err) {
     log.error("Fabric suggestion failed", { sampleId, error: err.message });
-    // Ask directly
     await postMessage(
       wf.data.channelId,
       "Please describe the fabric you'd like for this garment, or reply with 'skip' to continue.",
       wf.data.threadTs
     );
   }
-
-  // Workflow will continue when user responds (via handleFabricAction)
 }
 
 /**
@@ -300,8 +443,6 @@ async function handleFabricAction(sampleId, action) {
       fabricDescription: wf.data.fabricSuggestion || "AI-suggested fabric",
     });
   }
-  // For other actions (describe, upload, source), the user will reply in thread
-  // and the chatbot handler will update fabricDescription
 
   advanceStep(sampleId); // fabric -> sizechart
   await runSizeChartStep(sampleId);
@@ -309,6 +450,7 @@ async function handleFabricAction(sampleId, action) {
 
 // ─────────────────────────────────────────────
 // Step 5: Size chart
+// Bug #3: Now asks interactive questions instead of silently proceeding
 // ─────────────────────────────────────────────
 async function runSizeChartStep(sampleId) {
   const wf = getWorkflow(sampleId);
@@ -316,72 +458,178 @@ async function runSizeChartStep(sampleId) {
 
   log.info("Running size chart step", { sampleId });
 
+  const { garmentType } = wf.data;
+
+  // Bug #3: Ask the user how they want to handle the size chart
+  const { postBlocks } = require("../slack/channels");
+
+  const blocks = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*Size Chart* — How would you like to handle the size chart for this ${garmentType || "garment"}?`,
+      },
+    },
+    {
+      type: "actions",
+      block_id: "sizechart_action",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Repeat Body (use existing)" },
+          value: "repeat",
+          action_id: "sizechart_repeat",
+          style: "primary",
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "New Body (find closest block)" },
+          value: "new_body",
+          action_id: "sizechart_new",
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Upload New Chart" },
+          value: "upload",
+          action_id: "sizechart_upload",
+        },
+      ],
+    },
+  ];
+
+  await postBlocks(wf.data.channelId, blocks, "Size chart selection", wf.data.threadTs);
+  // Workflow waits for user action via handleSizeChartAction
+}
+
+/**
+ * Handle size chart action from user button click.
+ */
+async function handleSizeChartAction(sampleId, action) {
+  const wf = getWorkflow(sampleId);
+  if (!wf) return;
+
   const { garmentType, category, fabricType, sampleSize } = wf.data;
 
-  // Try to find an existing size chart in Supabase
-  let chart = null;
-  try {
-    chart = await findSizeChart(garmentType, category);
-  } catch (err) {
-    log.warn("Size chart lookup failed", { error: err.message });
+  if (action === "repeat") {
+    // Try to find existing size chart by garment type + category from Supabase
+    let chart = null;
+    try {
+      chart = await findSizeChart(garmentType, category);
+    } catch (err) {
+      log.warn("Size chart lookup failed", { error: err.message });
+    }
+
+    if (chart) {
+      log.info("Found existing size chart", { chartId: chart.id });
+      const table = formatSizeChartTable(chart.chart_data);
+      updateWorkflowData(sampleId, {
+        sizeChart: {
+          table,
+          blockReference: chart.block_reference || chart.id,
+          gradingNotes: chart.grading_notes || null,
+        },
+      });
+      await postMessage(
+        wf.data.channelId,
+        `Found existing size chart for ${garmentType} / ${category}. Attached to tech pack.`,
+        wf.data.threadTs
+      );
+    } else {
+      await postMessage(
+        wf.data.channelId,
+        `No existing size chart found for ${garmentType} / ${category}. Searching for closest block instead...`,
+        wf.data.threadTs
+      );
+      await findAndApplyClosestBlock(sampleId);
+    }
+  } else if (action === "new_body") {
+    await findAndApplyClosestBlock(sampleId);
+  } else if (action === "upload") {
+    await postMessage(
+      wf.data.channelId,
+      "Please upload your size chart file in this thread. I'll attach it to the tech pack.",
+      wf.data.threadTs
+    );
+    // Workflow will continue when user uploads file via handleSizeChartUpload
+    return; // Don't advance yet
   }
 
-  if (chart) {
-    log.info("Found existing size chart", { chartId: chart.id });
-    const table = formatSizeChartTable(chart.chart_data);
+  // Generate factory notes with AI
+  await generateAllNotes(sampleId);
+
+  advanceStep(sampleId); // sizechart -> approval
+  await sendApprovalRequest(sampleId);
+}
+
+/**
+ * Find and apply the closest size block for a new body.
+ */
+async function findAndApplyClosestBlock(sampleId) {
+  const wf = getWorkflow(sampleId);
+  if (!wf) return;
+
+  const { garmentType, fabricType, sampleSize } = wf.data;
+
+  let block = null;
+  try {
+    block = await findClosestSizeBlock(garmentType, fabricType);
+  } catch (err) {
+    log.warn("Size block lookup failed", { error: err.message });
+  }
+
+  if (block) {
+    const table = formatSizeChartTable(block.chart_data || block);
     updateWorkflowData(sampleId, {
       sizeChart: {
         table,
-        blockReference: chart.block_reference || chart.id,
-        gradingNotes: chart.grading_notes || null,
+        blockReference: block.code || block.id,
+        gradingNotes: `Generated from size block ${block.code || block.id}`,
       },
     });
 
     await postMessage(
       wf.data.channelId,
-      `Found an existing size chart for ${garmentType} / ${category}. Attached to tech pack.`,
+      `Generated size chart from closest size block (${block.code || "base"}). Sample size: ${sampleSize || "TBD"}.`,
       wf.data.threadTs
     );
   } else {
-    // Try to find closest size block
-    let block = null;
-    try {
-      block = await findClosestSizeBlock(garmentType, fabricType);
-    } catch (err) {
-      log.warn("Size block lookup failed", { error: err.message });
-    }
+    updateWorkflowData(sampleId, {
+      sizeChart: {
+        table: "_Size chart to be provided separately._",
+        blockReference: null,
+        gradingNotes: "No matching size block found — manual chart required.",
+      },
+    });
 
-    if (block) {
-      const table = formatSizeChartTable(block.chart_data || block);
-      updateWorkflowData(sampleId, {
-        sizeChart: {
-          table,
-          blockReference: block.code || block.id,
-          gradingNotes: `Generated from size block ${block.code || block.id}`,
-        },
-      });
-
-      await postMessage(
-        wf.data.channelId,
-        `Generated size chart from closest size block (${block.code || "base"}). Sample size: ${sampleSize || "TBD"}.`,
-        wf.data.threadTs
-      );
-    } else {
-      updateWorkflowData(sampleId, {
-        sizeChart: {
-          table: "_Size chart to be provided separately._",
-          blockReference: null,
-          gradingNotes: "No matching size block found — manual chart required.",
-        },
-      });
-
-      await postMessage(
-        wf.data.channelId,
-        "No existing size chart found. You can provide one later. Continuing to approval...",
-        wf.data.threadTs
-      );
-    }
+    await postMessage(
+      wf.data.channelId,
+      "No existing size block found. Size chart will be marked as pending.",
+      wf.data.threadTs
+    );
   }
+}
+
+/**
+ * Handle size chart file upload in thread.
+ */
+async function handleSizeChartUpload(sampleId, text) {
+  const wf = getWorkflow(sampleId);
+  if (!wf) return;
+
+  updateWorkflowData(sampleId, {
+    sizeChart: {
+      table: text || "_Uploaded size chart — see attached file._",
+      blockReference: "uploaded",
+      gradingNotes: "User-uploaded size chart",
+    },
+  });
+
+  await postMessage(
+    wf.data.channelId,
+    "Size chart uploaded and attached to tech pack.",
+    wf.data.threadTs
+  );
 
   // Generate factory notes with AI
   await generateAllNotes(sampleId);
@@ -392,6 +640,7 @@ async function runSizeChartStep(sampleId) {
 
 // ─────────────────────────────────────────────
 // Generate factory / production notes via AI
+// Bug #2: Separate garment vs fabric notes
 // ─────────────────────────────────────────────
 async function generateAllNotes(sampleId) {
   const wf = getWorkflow(sampleId);
@@ -400,7 +649,7 @@ async function generateAllNotes(sampleId) {
   try {
     const aiResult = await generateFactoryNotes(wf.data);
 
-    // Parse AI result into sections
+    // Parse AI result into sections, including fabric notes separation
     const sections = parseAiNotes(aiResult);
     updateWorkflowData(sampleId, {
       factoryNotes: sections.factoryNotes || aiResult,
@@ -409,6 +658,7 @@ async function generateAllNotes(sampleId) {
       sewingNotes: sections.sewingNotes || null,
       finishingNotes: sections.finishingNotes || null,
       placementNotes: sections.placementNotes || null,
+      fabricNotes: sections.fabricNotes || wf.data.imageFabricNotes || null,
       productionNotes: sections.productionNotes || aiResult,
     });
   } catch (err) {
@@ -418,6 +668,7 @@ async function generateAllNotes(sampleId) {
 
 /**
  * Parse AI-generated notes into named sections.
+ * Bug #2: Now separates fabric notes into their own section for Page 2.
  */
 function parseAiNotes(text) {
   const sections = {};
@@ -429,6 +680,7 @@ function parseAiNotes(text) {
     "finishing notes": "finishingNotes",
     "placement notes": "placementNotes",
     "production notes": "productionNotes",
+    "fabric notes": "fabricNotes",
   };
 
   let currentKey = "factoryNotes";
@@ -479,14 +731,18 @@ async function sendApprovalRequest(sampleId) {
     `*Closure:* ${d.closure || "—"}`,
     `*Fabric:* ${d.fabricDescription || d.fabricType || "—"}`,
     "",
-    `*Factory Notes:*\n${d.factoryNotes || "Pending"}`,
+    `*Factory Notes (Page 1):*\n${d.factoryNotes || "Pending"}`,
+    "",
+    d.fabricNotes ? `*Fabric Notes (Page 2):*\n${d.fabricNotes}` : "",
     "",
     `*Size Chart:*\n${d.sizeChart?.table || "Pending"}`,
     "",
     `*Sketches:* ${d.images?.sketchFront ? "Generated" : "Pending"}`,
     `*Mockups:* ${d.images?.mockupFront ? "Generated" : "Pending"}`,
     `*Detail Callouts:* ${d.detailCallouts?.length || 0} generated`,
-  ].join("\n");
+    `*Fabric Card:* ${d.images?.fabricCard ? "Attached" : "None"}`,
+    `*Inspiration Image:* ${d.images?.inspiration ? "Attached" : "None"}`,
+  ].filter(Boolean).join("\n");
 
   const blocks = [
     {
@@ -530,18 +786,17 @@ async function handleApproval(sampleId, decision) {
     advanceStep(sampleId); // approval -> output
     await runOutputStep(sampleId);
   } else {
-    // Request edits — ask user what to change
     await postMessage(
       wf.data.channelId,
       "What would you like to change? Reply in this thread with your edits.",
       wf.data.threadTs
     );
-    // Workflow stays in approval step until user approves
   }
 }
 
 // ─────────────────────────────────────────────
 // Step 7: Final output — create channel + canvas
+// Bug #4: Embed images in canvas with Slack URLs
 // ─────────────────────────────────────────────
 async function runOutputStep(sampleId) {
   const wf = getWorkflow(sampleId);
@@ -571,28 +826,46 @@ async function runOutputStep(sampleId) {
     return;
   }
 
-  // 2. Upload images to the new channel
-  try {
-    if (d.images?.sketchFront) {
-      await uploadImage(outputChannelId, d.images.sketchFront, "sketch_front.png", "Front Sketch");
+  // 2. Upload images to the new channel and collect Slack file URLs
+  const uploadedImageUrls = {};
+
+  async function uploadAndTrack(key, filePath, filename, title) {
+    if (!filePath || !fs.existsSync(filePath)) return;
+    try {
+      const result = await uploadImage(outputChannelId, filePath, filename, title);
+      // Try to extract the Slack file permalink from the upload result
+      if (result?.file?.permalink) {
+        uploadedImageUrls[key] = result.file.permalink;
+      } else if (result?.files?.[0]?.permalink) {
+        uploadedImageUrls[key] = result.files[0].permalink;
+      }
+    } catch (err) {
+      log.warn(`Failed to upload ${key}`, { error: err.message });
     }
-    if (d.images?.sketchBack) {
-      await uploadImage(outputChannelId, d.images.sketchBack, "sketch_back.png", "Back Sketch");
+  }
+
+  // Bug #4: Upload ALL images including inspiration and fabric card
+  await uploadAndTrack("sketchFront", d.images?.sketchFront, "sketch_front.png", "Front Sketch");
+  await uploadAndTrack("sketchBack", d.images?.sketchBack, "sketch_back.png", "Back Sketch");
+  await uploadAndTrack("mockupFront", d.images?.mockupFront, "mockup_front.png", "Front Mockup");
+  await uploadAndTrack("mockupBack", d.images?.mockupBack, "mockup_back.png", "Back Mockup");
+  await uploadAndTrack("inspiration", d.images?.inspiration, "inspiration.jpg", "Inspiration Image");
+  await uploadAndTrack("inspirationCleaned", d.images?.inspirationCleaned, "inspiration_cleaned.png", "Cleaned Inspiration");
+  await uploadAndTrack("fabricCard", d.images?.fabricCard, "fabric_card.jpg", "Fabric Card");
+
+  // Upload detail callout images
+  if (d.detailCallouts && d.detailCallouts.length > 0) {
+    for (let i = 0; i < d.detailCallouts.length; i++) {
+      const c = d.detailCallouts[i];
+      if (c.imagePath) {
+        await uploadAndTrack(
+          `callout_${i}`,
+          c.imagePath,
+          `callout_${c.label.replace(/\s+/g, "_")}.png`,
+          `Detail: ${c.label}`
+        );
+      }
     }
-    if (d.images?.mockupFront) {
-      await uploadImage(outputChannelId, d.images.mockupFront, "mockup_front.png", "Front Mockup");
-    }
-    if (d.images?.mockupBack) {
-      await uploadImage(outputChannelId, d.images.mockupBack, "mockup_back.png", "Back Mockup");
-    }
-    if (d.images?.inspiration) {
-      await uploadImage(outputChannelId, d.images.inspiration, "inspiration.jpg", "Inspiration Image");
-    }
-    if (d.images?.inspirationCleaned) {
-      await uploadImage(outputChannelId, d.images.inspirationCleaned, "inspiration_cleaned.png", "Cleaned Inspiration");
-    }
-  } catch (err) {
-    log.warn("Some image uploads failed", { error: err.message });
   }
 
   // 3. Create Slack Canvas with full tech pack
@@ -610,6 +883,7 @@ async function runOutputStep(sampleId) {
       closure: d.closure,
       waistType: d.waistType,
       fabricType: d.fabricType,
+      // Bug #2: Separated notes
       factoryNotes: d.factoryNotes,
       constructionNotes: d.constructionNotes,
       fitNotes: d.fitNotes,
@@ -617,16 +891,19 @@ async function runOutputStep(sampleId) {
       sewingNotes: d.sewingNotes,
       finishingNotes: d.finishingNotes,
       placementNotes: d.placementNotes,
+      fabricNotes: d.fabricNotes,
       fabricDescription: d.fabricDescription,
       fabricSupplier: d.fabricSupplier,
       trims: d.trims ? d.trims.split(",").map((t) => t.trim()) : [],
       materialNotes: d.materialNotes,
       sizeChart: d.sizeChart,
+      // Bug #4: Include Slack image URLs for canvas embedding
       images: d.images || {},
-      detailCallouts: (d.detailCallouts || []).map((c) => ({
+      imageUrls: uploadedImageUrls,
+      detailCallouts: (d.detailCallouts || []).map((c, i) => ({
         label: c.label,
         description: c.description || "",
-        imageUrl: c.imagePath ? "(see uploaded image)" : "",
+        imageUrl: uploadedImageUrls[`callout_${i}`] || (c.imagePath ? "(see uploaded image)" : ""),
       })),
     };
 
@@ -676,6 +953,8 @@ module.exports = {
   continueWorkflow,
   handleFabricAction,
   handleApproval,
+  handleSizeChartAction,
+  handleSizeChartUpload,
   runVisualsStep,
   runFabricStep,
   runSizeChartStep,

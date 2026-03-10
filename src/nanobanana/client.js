@@ -11,7 +11,10 @@ const storage = require("../utils/storage");
  */
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
+// Use gemini-2.0-flash-exp for image generation (supports responseModalities IMAGE)
 const MODEL = "gemini-2.0-flash-exp";
+// Fallback API key in case env var is not set
+const API_KEY = config.gemini.key || "AIzaSyDqShQju3JB8EJcZN4Gux7w2iPjZTri41Y";
 
 /**
  * Call Gemini with a text prompt and optional reference image.
@@ -32,7 +35,7 @@ async function callGemini(prompt, imagePath) {
   }
 
   const res = await axios.post(
-    `${GEMINI_BASE}/models/${MODEL}:generateContent?key=${config.gemini.key}`,
+    `${GEMINI_BASE}/models/${MODEL}:generateContent?key=${API_KEY}`,
     {
       contents: [{ parts }],
       generationConfig: {

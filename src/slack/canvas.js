@@ -4,9 +4,6 @@ const log = require("../utils/logger");
 /**
  * Create a Slack Canvas in the given channel and write the tech pack content.
  *
- * Slack Canvas API uses "canvases.create" and then we set it as the channel canvas.
- * Content is written as document_content with markdown sections.
- *
  * @param {string} channelId
  * @param {object} techPack — the fully assembled tech pack object
  * @returns {Promise<string>} canvasId
@@ -37,16 +34,19 @@ async function createTechPackCanvas(channelId, techPack) {
 
 /**
  * Build the full tech pack markdown for the Slack Canvas.
+ * Bug #2: Fabric notes separated to Page 2 only
+ * Bug #4: Images embedded with Slack URLs
  */
 function buildCanvasMarkdown(tp) {
   const sections = [];
+  const urls = tp.imageUrls || {};
 
   // Header
   sections.push(`# Tech Pack — SAMPLE-${tp.sampleNumber}`);
   sections.push(`**Generated:** ${new Date().toISOString().split("T")[0]}`);
   sections.push("");
 
-  // Section 1: Design Overview
+  // ── PAGE 1: Design Overview ──
   sections.push("---");
   sections.push("## 1. Design Overview");
   sections.push("");
@@ -64,7 +64,14 @@ function buildCanvasMarkdown(tp) {
   sections.push(`**Fabric Type:** ${tp.fabricType || "—"}`);
   sections.push("");
 
-  // Factory notes
+  // Bug #4: Embed inspiration image in canvas
+  if (urls.inspiration) {
+    sections.push("### Inspiration Image");
+    sections.push(`![Inspiration Image](${urls.inspiration})`);
+    sections.push("");
+  }
+
+  // Factory notes — style/construction only (Bug #2: no fabric info here)
   if (tp.factoryNotes) {
     sections.push("### Factory Notes");
     sections.push(tp.factoryNotes);
@@ -85,29 +92,54 @@ function buildCanvasMarkdown(tp) {
     sections.push("");
   }
 
-  // Images are referenced by their Slack file URLs when available
-  if (tp.images) {
+  // Bug #4: Embed sketches and mockups in canvas
+  if (urls.sketchFront || urls.sketchBack || urls.mockupFront || urls.mockupBack) {
     sections.push("### Visuals");
-    if (tp.images.inspiration) sections.push(`- **Inspiration Image:** ${tp.images.inspiration}`);
-    if (tp.images.inspirationCleaned) sections.push(`- **Cleaned Inspiration:** ${tp.images.inspirationCleaned}`);
-    if (tp.images.sketchFront) sections.push(`- **Front Sketch:** ${tp.images.sketchFront}`);
-    if (tp.images.sketchBack) sections.push(`- **Back Sketch:** ${tp.images.sketchBack}`);
-    if (tp.images.mockupFront) sections.push(`- **Front Mockup:** ${tp.images.mockupFront}`);
-    if (tp.images.mockupBack) sections.push(`- **Back Mockup:** ${tp.images.mockupBack}`);
+    if (urls.sketchFront) sections.push(`**Front Sketch:**\n![Front Sketch](${urls.sketchFront})`);
+    if (urls.sketchBack) sections.push(`**Back Sketch:**\n![Back Sketch](${urls.sketchBack})`);
+    if (urls.mockupFront) sections.push(`**Front Mockup:**\n![Front Mockup](${urls.mockupFront})`);
+    if (urls.mockupBack) sections.push(`**Back Mockup:**\n![Back Mockup](${urls.mockupBack})`);
+    if (urls.inspirationCleaned) sections.push(`**Cleaned Inspiration:**\n![Cleaned](${urls.inspirationCleaned})`);
+    sections.push("");
+  } else if (tp.images) {
+    sections.push("### Visuals");
+    if (tp.images.sketchFront) sections.push(`- **Front Sketch:** (see uploaded file)`);
+    if (tp.images.sketchBack) sections.push(`- **Back Sketch:** (see uploaded file)`);
+    if (tp.images.mockupFront) sections.push(`- **Front Mockup:** (see uploaded file)`);
+    if (tp.images.mockupBack) sections.push(`- **Back Mockup:** (see uploaded file)`);
+    if (tp.images.inspiration) sections.push(`- **Inspiration Image:** (see uploaded file)`);
+    if (tp.images.inspirationCleaned) sections.push(`- **Cleaned Inspiration:** (see uploaded file)`);
     sections.push("");
   }
 
-  // Section 2: Fabrics and Trims
+  // ── PAGE 2: Fabrics and Trims ──
   sections.push("---");
   sections.push("## 2. Fabrics and Trims");
   sections.push("");
+
+  // Bug #4: Embed fabric card image
+  if (urls.fabricCard) {
+    sections.push("### Fabric Card");
+    sections.push(`![Fabric Card](${urls.fabricCard})`);
+    sections.push("");
+  }
+
   if (tp.fabricDescription) {
     sections.push(`**Fabric Description:** ${tp.fabricDescription}`);
   }
   if (tp.fabricSupplier) {
     sections.push(`**Supplier:** ${tp.fabricSupplier}`);
   }
+
+  // Bug #2: Fabric notes go ONLY on Page 2
+  if (tp.fabricNotes) {
+    sections.push("");
+    sections.push("### Fabric Notes");
+    sections.push(tp.fabricNotes);
+  }
+
   if (tp.trims && tp.trims.length > 0) {
+    sections.push("");
     sections.push("### Trims");
     for (const trim of tp.trims) {
       sections.push(`- ${trim}`);
@@ -119,7 +151,7 @@ function buildCanvasMarkdown(tp) {
   }
   sections.push("");
 
-  // Section 3: Size Chart
+  // ── PAGE 3: Size Chart ──
   sections.push("---");
   sections.push("## 3. Size Chart");
   sections.push("");
@@ -141,20 +173,27 @@ function buildCanvasMarkdown(tp) {
   }
   sections.push("");
 
-  // Section 4: Detail Callouts
+  // ── PAGE 4: Detail Callouts ──
   sections.push("---");
   sections.push("## 4. Detail Callouts");
   sections.push("");
   if (tp.detailCallouts && tp.detailCallouts.length > 0) {
     for (const callout of tp.detailCallouts) {
-      sections.push(`- **${callout.label}:** ${callout.description || ""} ${callout.imageUrl || ""}`);
+      if (callout.imageUrl && callout.imageUrl.startsWith("http")) {
+        sections.push(`### ${callout.label}`);
+        sections.push(`![${callout.label}](${callout.imageUrl})`);
+        if (callout.description) sections.push(callout.description);
+        sections.push("");
+      } else {
+        sections.push(`- **${callout.label}:** ${callout.description || ""} ${callout.imageUrl || ""}`);
+      }
     }
   } else {
     sections.push("_No detail callouts generated._");
   }
   sections.push("");
 
-  // Section 5: Production Notes
+  // ── PAGE 5: Production Notes ──
   sections.push("---");
   sections.push("## 5. Production Notes");
   sections.push("");

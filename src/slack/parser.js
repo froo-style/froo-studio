@@ -105,8 +105,60 @@ function extractKnownFields(notes) {
     if (lower.includes(w)) { known.waistType = w; break; }
   }
 
+  // Sample size detection — scan for common size references (Bug #6)
+  if (!known.sampleSize) {
+    const ageSize = notes.match(/\b(\d{1,2})\s*[Yy]\b/);
+    if (ageSize) {
+      known.sampleSize = `${ageSize[1]}Y`;
+    }
+    if (!known.sampleSize) {
+      const toddlerSize = notes.match(/\b(\d)[Tt]\b/);
+      if (toddlerSize) known.sampleSize = `${toddlerSize[1]}T`;
+    }
+    if (!known.sampleSize) {
+      const monthSize = notes.match(/\b(\d{1,2})\s*[Mm]\b/);
+      if (monthSize) known.sampleSize = `${monthSize[1]}M`;
+    }
+    if (!known.sampleSize) {
+      const adultSize = notes.match(/\b(XXL|XL|XS|[SML])\b/);
+      if (adultSize) known.sampleSize = adultSize[1].toUpperCase();
+    }
+    if (!known.sampleSize) {
+      const numericSize = notes.match(/\bsize\s*(\d{1,2})\b/i);
+      if (numericSize) known.sampleSize = numericSize[1];
+    }
+  }
+
   log.debug("Extracted known fields from notes", { known });
   return known;
 }
 
-module.exports = { parseSampleMessage, extractKnownFields };
+/**
+ * Detect which uploaded images are likely fabric cards vs inspiration images.
+ * Returns { inspirationImages, fabricCardImages } arrays of file objects.
+ */
+function classifyUploadedImages(imageFiles) {
+  const fabricCardImages = [];
+  const inspirationImages = [];
+
+  for (const f of imageFiles) {
+    const name = (f.name || f.title || "").toLowerCase();
+    const isFabricCard =
+      name.includes("fabric") ||
+      name.includes("swatch") ||
+      name.includes("card") ||
+      name.includes("composition") ||
+      name.includes("material") ||
+      name.includes("textile");
+
+    if (isFabricCard) {
+      fabricCardImages.push(f);
+    } else {
+      inspirationImages.push(f);
+    }
+  }
+
+  return { inspirationImages, fabricCardImages };
+}
+
+module.exports = { parseSampleMessage, extractKnownFields, classifyUploadedImages };

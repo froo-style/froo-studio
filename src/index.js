@@ -15,6 +15,8 @@ const {
   continueWorkflow,
   handleFabricAction,
   handleApproval,
+  handleSizeChartAction,
+  handleSizeChartUpload,
 } = require("./workflow/pipeline");
 const { handleButtonAnswer, handleThreadReply } = require("./workflow/chatbot");
 const { ensureDir } = require("./utils/storage");
@@ -174,6 +176,51 @@ async function main() {
     }
   });
 
+  // ───────────────────────────────────────────
+  // 3. Size chart action buttons (Bug #3)
+  // ───────────────────────────────────────────
+  app.action("sizechart_repeat", async ({ action, body, ack }) => {
+    await ack();
+    try {
+      const channelId = body.channel?.id;
+      const threadTs = body.message?.thread_ts;
+      const wf = findWorkflowByThread(channelId, threadTs);
+      if (wf) {
+        await handleSizeChartAction(wf.sampleId, "repeat");
+      }
+    } catch (err) {
+      log.error("Error handling sizechart repeat", { error: err.message });
+    }
+  });
+
+  app.action("sizechart_new", async ({ action, body, ack }) => {
+    await ack();
+    try {
+      const channelId = body.channel?.id;
+      const threadTs = body.message?.thread_ts;
+      const wf = findWorkflowByThread(channelId, threadTs);
+      if (wf) {
+        await handleSizeChartAction(wf.sampleId, "new_body");
+      }
+    } catch (err) {
+      log.error("Error handling sizechart new body", { error: err.message });
+    }
+  });
+
+  app.action("sizechart_upload", async ({ action, body, ack }) => {
+    await ack();
+    try {
+      const channelId = body.channel?.id;
+      const threadTs = body.message?.thread_ts;
+      const wf = findWorkflowByThread(channelId, threadTs);
+      if (wf) {
+        await handleSizeChartAction(wf.sampleId, "upload");
+      }
+    } catch (err) {
+      log.error("Error handling sizechart upload", { error: err.message });
+    }
+  });
+
   // Approval action buttons
   app.action("techpack_approve", async ({ action, body, ack }) => {
     await ack();
@@ -236,18 +283,18 @@ async function handleWorkflowReply(message) {
     return;
   }
 
+  // If we're in the sizechart step and user sends text/file, treat as size chart upload
+  if (wf.step === "sizechart" && text) {
+    await handleSizeChartUpload(wf.sampleId, text);
+    return;
+  }
+
   // If we're in the approval step and user sends edits
   if (wf.step === "approval" && text) {
     const { postMessage } = require("./slack/channels");
-    // Parse edits and update workflow
     const { updateWorkflowData } = require("./workflow/state");
     updateWorkflowData(wf.sampleId, { additionalDetails: text });
     await postMessage(channelId, "Edits noted. Regenerating notes...", threadTs);
-
-    // Re-generate notes and re-send approval
-    const { generateAllNotes, sendApprovalRequest } = require("./workflow/pipeline");
-    // We import from pipeline — but sendApprovalRequest is not exported as a standalone.
-    // Instead use continueWorkflow which will re-run the approval step.
     await continueWorkflow(wf.sampleId);
     return;
   }
